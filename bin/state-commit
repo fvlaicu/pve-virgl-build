@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Commits the state checkout ($STATE, the state branch) and pushes it, if anything tracked changed.
+# Run by the jobs that change the state (publish, site, rollback), as github-actions[bot].
+#   state-commit <message>
+# Outside a git checkout (local tests) it only lists what changed.
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+(( $# == 1 )) || die "usage: state-commit <message>"
+cd "$STATE"
+state_gitignore
+if [[ ! -d .git ]]; then
+    log "[state] $STATE isn't a git checkout; not committed"
+    exit 0
+fi
+git add -A
+if git diff --cached --quiet; then
+    log "[state] nothing to commit"
+    exit 0
+fi
+git diff --cached --stat >&2
+git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+    commit -q -m "$1"
+git push -q origin HEAD:state
+log "[state] committed and pushed: $1"

@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# The plan's verify checks for one finished build, with the runner's tools (dpkg-deb, binutils,
+# tar). One line per check. Exits non-zero if any check fails; nothing of that product is published
+# then. Reads only. build-one saves the output as verify.txt, and publish runs it again (the build
+# job ran upstream code, so its own verdict isn't trusted) as verify-publish.txt.
+#   verify <qemu|virglrenderer|mesa|bundle> <build dir> <version or bundle name>
+# shellcheck disable=SC2016  # bash -c and awk programs in single quotes, on purpose
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+(( $# == 3 )) || die "usage: verify <qemu|virglrenderer|mesa|bundle> <build dir> <version>"
+p=$1 d=$2 v=$3
+fail=0
+ok() { echo "ok    $*"; }
+bad() { echo "FAIL  $*"; fail=1; }
+check() { # description command... → ok if the command succeeds
+    local what=$1; shift
+    if "$@" >/dev/null 2>&1; then ok "$what"; else bad "$what"; fi
+}
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+# shellcheck disable=SC2329  # called through check
+log_has() { grep -qE -- "$1" "$d/build.log"; }
+# shellcheck disable=SC2329  # called through check
+log_lacks() { ! grep -qE -- "$1" "$d/build.log"; }
+
+check_source_tar() { # tar origin commit → ok if it's that origin's source at that commit, and every
+    # file its APKBUILD's sha512sums name is in it and matches
+    local t=$1 origin=$2 c=$3 x n dir sum f p count=0 mism=0
+    n=${t##*/} x=$tmp/src-$origin
+    [[ -f $t ]] || { bad "$n missing"; return 0; }
+    # Unpacked here, on the runner: only files and directories, all under SOURCE-INFO, aports/ or
+    # distfiles/, without '..' (no links that a later entry could write through).
+    if ! tar -tvf "$t" 2>/dev/null | awk '{ y = substr($1, 1, 1); m = $6 }
+            y != "-" && y != "d" { exit 1 }
+            m !~ /^(SOURCE-INFO|aports(\/|$)|distfiles(\/|$))/ || m ~ /(^|\/)\.\.(\/|$)/ { exit 1 }'; then
+        bad "$n: an entry that isn't a file or directory under SOURCE-INFO, aports/ or distfiles/"; return 0
+    fi
+    mkdir -p "$x"
+    tar -xf "$t" -C "$x" --no-same-owner 2>/dev/null || { bad "$n: tar can't unpack it"; return 0; }
+    dir=$(kv_get "$x/SOURCE-INFO" aports_dir)
+    [[ $dir =~ ^(main|community)/$origin$ && -f $x/aports/$dir/APKBUILD ]] || { bad "$n: no aports main/$origin or community/$origin"; return 0; }
+    [[ $(kv_get "$x/SOURCE-INFO" aports_commit) == "$c" ]] || { bad "$n: aports commit isn't SOURCES' $c"; return 0; }
+    while read -r sum f; do
+        count=$((count + 1))
+        p=$x/aports/$dir/$f
+        [[ -f $p ]] || p=$x/distfiles/$f
+        if [[ ! -f $p || $(sha512sum < "$p" | cut -d' ' -f1) != "$sum" ]]; then bad "$n: $f missing or not matching the APKBUILD"; mism=1; fi
+    done < <(awk '/^sha512sums="/ { on = 1; sub(/^sha512sums="/, "") }
+                  on { last = sub(/".*$/, ""); if (NF == 2) print $1, $2; if (last) exit }' "$x/aports/$dir/APKBUILD")
+    if (( count == 0 )); then bad "$n: no sha512sums in its APKBUILD"
+    elif (( ! mism )); then ok "$n: aports $dir at ${c:0:12}, $count files match its APKBUILD's sha512sums"
+    fi
+    rm -rf "$x"
+}
+deb_field() { dpkg-deb -f "$1" "$2" 2>/dev/null; }
+suffix_ok() {
+    if [[ $v =~ virgl[0-9]+$ ]]; then ok "version $v ends in virgl<N>"; else bad "version $v doesn't end in virgl<N>"; fi
+}
+check_debs() { # package... → each one's deb exists in the build dir with Package and Version right
+    local pkg f
+    for pkg; do
+        f=$d/${pkg}_${v}_amd64.deb
+        if [[ -f $f && $(deb_field "$f" Package) == "$pkg" && $(deb_field "$f" Version) == "$v" ]]; then
+            ok "$pkg $v built"
+        else
+            bad "$pkg $v missing or wrong Package/Version"
+        fi
+    done
+}
+
+case $p in
+qemu)
+    suffix_ok
+    check_debs pve-qemu-kvm pve-qemu-kvm-dbgsym
+    check "the log shows our patch applied (applying extra/9999-virgl-video-get-drm-fd.patch)" \
+        log_has '^dpkg-source: info: applying extra/9999-virgl-video-get-drm-fd\.patch$'
+    # QEMU must not need a newer virglrenderer than the trixie base we build on: that independence is
+    # what lets the two rebuild separately (plan, "The three products").
+    floor=$(deb_field "$d/pve-qemu-kvm_${v}_amd64.deb" Depends | grep -oE 'libvirglrenderer1 \(>= [^)]+\)' | sed 's/.*>= //; s/)//' || true)
+    vbase=$(kv_get "$PLAN/upstream" virglrenderer_base)   # this run's upstream check
+    if [[ -n $floor && -n $vbase ]] && dpkg --compare-versions "$floor" le "$vbase"; then
+        ok "depends on libvirglrenderer1 (>= $floor), which Debian's $vbase satisfies"
+    else
+        bad "libvirglrenderer1 dependency '${floor:-none}' vs Debian's ${vbase:-unknown}"
+    fi
+    want=${vbase%%-*}
+    check "configure found virglrenderer ${want:-?} (Run-time dependency virglrenderer found: YES ${want:-?})" \
+        log_has "^Run-time dependency virglrenderer found: YES ${want//./\\.}\$"
+    ;;
+virglrenderer)
+    suffix_ok
+    check_debs libvirglrenderer1 libvirglrenderer1-dbgsym libvirglrenderer-dev virgl-server virgl-server-dbgsym
+    check "the log shows our patch applied (applying 9999-virgl-video-fixes.patch)" \
+        log_has '^dpkg-source: info: applying 9999-virgl-video-fixes\.patch$'
+    check "no compiler warnings in virgl_video.[ch] / vrend_video.c" \
+        log_lacks '(virgl_video|vrend_video)\.[ch]:[0-9]+:[0-9]+: warning'
+    check "meson summary: video : true" log_has '^ +video +: true$'
+    if dpkg-deb -x "$d/libvirglrenderer1_${v}_amd64.deb" "$tmp/lib" 2>/dev/null; then
+        so=$(find "$tmp/lib" -name 'libvirglrenderer.so.1.*' -type f | head -n 1)
+        strings -a "$so" > "$tmp/strings" 2>/dev/null || true
+        check "the library has the packed-header error strings (part 4 of the patch)" \
+            grep -qF 'H.264 packed header %u too long, none sent' "$tmp/strings"
+        check "the library has no diagnostic strings (VIRGL_DIAG, virgl-diag)" \
+            bash -c '! grep -qE "VIRGL_DIAG|virgl-diag" "$1"' _ "$tmp/strings"
+    else
+        bad "could not unpack libvirglrenderer1"
+    fi
+    ;;
+mesa)
+    pkgrel=${v##*-r}
+    if (( pkgrel > 100 )); then ok "pkgrel r$pkgrel = 100 + N"; else bad "pkgrel r$pkgrel isn't 100 + N"; fi
+    n=0 missing=0
+    while read -r apk; do
+        n=$((n + 1))
+        [[ -f $d/$apk ]] || { bad "missing $apk"; missing=1; }
+    done < "$d/expected-apks.txt"
+    if (( n == 0 )); then bad "abuild listed no packages (expected-apks.txt)"
+    elif (( missing == 0 )); then ok "all $n packages abuild listed are there, at $v"
+    fi
+    other=$(find "$d" -maxdepth 1 -name '*.apk' ! -name "*-$v.apk" | wc -l)
+    (( other == 0 )) || bad "$other apk(s) with another version in the build dir"
+    # The patches abuild applied, in order, must be the recipe's (ours appended last).
+    if diff <(sed -n 's/^>>> mesa: \(.*\.patch\)$/\1/p' "$d/build.log") "$d/expected-patches.txt" > "$tmp/patches.diff"; then
+        ok "patches applied in recipe order, ours last: $(paste -sd' ' "$d/expected-patches.txt")"
+    else
+        bad "applied patches differ from the recipe's list:"; sed 's/^/      /' "$tmp/patches.diff"
+    fi
+    # Part 3 of the patch adds this function; in the hand builds, r101's debug info had it and
+    # r100's (built without part 3) didn't.
+    if tar -xzf "$d/mesa-dbg-$v.apk" -C "$tmp" --wildcards --warning=no-unknown-keyword --ignore-zeros \
+           'usr/lib/debug/usr/lib/libgallium-*.so.debug' 2>/dev/null; then
+        dbg=$(find "$tmp/usr/lib/debug" -name 'libgallium-*.so.debug' | head -n 1)
+        check "debug info has virgl_video_buffer_sampler_view_components" \
+            bash -c 'nm "$1" | grep -q " virgl_video_buffer_sampler_view_components$"' _ "$dbg"
+    else
+        bad "could not unpack libgallium's debug info from mesa-dbg-$v.apk"
+    fi
+    ;;
+bundle)
+    tgz=$d/$v.tar.gz
+    check "$v.tar.gz and MANIFEST exist" test -f "$tgz" -a -f "$d/MANIFEST"
+    # The Plex VM unpacks this as root: only files, directories and hard links, all under vaapi/.
+    tar -tvzf "$tgz" > "$tmp/list" 2>/dev/null || bad "tar can't list $v.tar.gz"
+    check "every entry is a file, directory or hard link under vaapi/, without '..'" \
+        awk '{ t = substr($1, 1, 1); n = $6 }
+             t != "-" && t != "d" && t != "h" { exit 1 }
+             n !~ /^vaapi(\/|$)/ || n ~ /(^|\/)\.\.(\/|$)/ { exit 1 }' "$tmp/list"
+    # the whole dri/: one of the two driver names is stored as a hard link to the other
+    tar -xzf "$tgz" -C "$tmp" vaapi/lib/dri 2>/dev/null || true
+    drv=$tmp/vaapi/lib/dri/virtio_gpu_drv_video.so
+    mesa=$(kv_get "$d/MANIFEST" mesa)
+    owner=$(awk '$1 == "file" && $3 == "vaapi/lib/dri/virtio_gpu_drv_video.so" { print $4 }' "$d/MANIFEST")
+    if [[ -n $mesa && $owner == "mesa-$mesa" ]]; then ok "the driver comes from our mesa $mesa"
+    else bad "the driver comes from '${owner:-?}', not our mesa ${mesa:-?}"
+    fi
+    check "our Mesa packages are marked local in the MANIFEST" \
+        grep -qx "owner mesa $mesa local" "$d/MANIFEST"
+    sym=$(grep -ao '__vaDriverInit_1_[0-9]*' "$drv" 2>/dev/null | sort -u || true)
+    if [[ $sym =~ ^__vaDriverInit_1_([0-9]+)$ ]] && (( BASH_REMATCH[1] <= PLEX_LIBVA_MINOR )); then
+        ok "init symbol $sym loads with Plex's libva 2.$PLEX_LIBVA_MINOR"
+    else
+        bad "init symbol '${sym:-none}' vs Plex's libva 2.$PLEX_LIBVA_MINOR"
+    fi
+    rp=$(readelf -d "$drv" 2>/dev/null | sed -n 's/.*(RUNPATH).*\[\(.*\)\]/\1/p' || true)
+    # shellcheck disable=SC2016  # $ORIGIN is literal
+    if [[ $rp == '/vaapi/lib:$ORIGIN/..' ]]; then ok "driver RUNPATH $rp"; else bad "driver RUNPATH '${rp:-none}'"; fi
+    check "make-musl-va.sh found every dependency inside the bundle" \
+        log_has '^all dependencies resolve inside the bundle$'
+    # Sources (docs/DESIGN.md, "Licenses"): a package whose origin is in BUNDLE_SOURCE_ORIGINS has
+    # its origin's source tar; every other package's license is, exactly, one in
+    # BUNDLE_LICENSES_NO_SOURCE. A new library or license field fails here until build.conf names it.
+    declare -A attach=() reviewed=() tars=() seen=()
+    for og in $BUNDLE_SOURCE_ORIGINS; do attach[$og]=1; done
+    while IFS= read -r l; do [[ -z $l ]] || reviewed[$l]=1; done <<<"$BUNDLE_LICENSES_NO_SOURCE"
+    pkgs=0 unreviewed=0
+    while IFS= read -r l; do
+        [[ $l != '#'* ]] || continue
+        if [[ ! $l =~ ^([^ ]+)\ ([^ ]+)\ origin=([^ ]+)\ commit=([^ ]+)\ license=(.+)$ ]]; then
+            bad "SOURCES line not understood: $l"; continue
+        fi
+        pkgs=$((pkgs + 1))
+        seen[${BASH_REMATCH[3]}]=1
+        if [[ -n ${attach[${BASH_REMATCH[3]}]:-} ]]; then
+            tars[source-${BASH_REMATCH[3]}-${BASH_REMATCH[2]}.tar]="${BASH_REMATCH[3]} ${BASH_REMATCH[4]}"
+        elif [[ -z ${reviewed[${BASH_REMATCH[5]}]:-} ]]; then
+            bad "${BASH_REMATCH[1]} (origin ${BASH_REMATCH[3]}): license '${BASH_REMATCH[5]}' is neither in BUNDLE_LICENSES_NO_SOURCE nor is its origin in BUNDLE_SOURCE_ORIGINS"
+            unreviewed=1
+        fi
+    done < "$d/SOURCES"
+    if (( pkgs == 0 )); then bad "SOURCES lists no packages"
+    elif (( ! unreviewed )); then ok "SOURCES: $pkgs packages, each with a reviewed license or its source attached"
+    fi
+    for t in "${!tars[@]}"; do
+        read -r og c <<<"${tars[$t]}"
+        check_source_tar "$d/$t" "$og" "$c"
+    done
+    # License texts (from the repo's licenses/): the README, our own license, and for every origin
+    # its FROM and at least one text.
+    awk '{ print $6 }' "$tmp/list" > "$tmp/names"
+    check "vaapi/licenses/README and pve-virgl-build.LICENSE are in the bundle" \
+        bash -c 'grep -qx vaapi/licenses/README "$1" && grep -qx vaapi/licenses/pve-virgl-build.LICENSE "$1"' _ "$tmp/names"
+    nolic=()
+    for og in "${!seen[@]}"; do
+        texts=$(awk -v p="vaapi/licenses/$og/" 'index($0, p) == 1 && $0 !~ /\/$/ && $0 != p "FROM"' "$tmp/names" | wc -l)
+        if ! grep -qxF "vaapi/licenses/$og/FROM" "$tmp/names" || (( texts == 0 )); then nolic+=("$og"); fi
+    done
+    if (( ${#nolic[@]} )); then bad "no license texts in the bundle for: ${nolic[*]}"
+    elif (( ${#seen[@]} )); then ok "license texts in the bundle for all ${#seen[@]} origins"
+    fi
+    ;;
+*) die "unknown product $p" ;;
+esac
+
+if (( fail == 0 )); then echo "VERIFY: PASS"; else echo "VERIFY: FAIL"; fi
+exit "$fail"

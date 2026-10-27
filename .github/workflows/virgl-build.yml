@@ -1,0 +1,288 @@
+# The virgl builds (docs/DESIGN.md): check upstream, build what changed, verify, publish, deploy.
+# Only the publish job has the signing key (environment "publish"); the jobs that run upstream code
+# (the builds) never see it. Actions are GitHub's own, pinned by commit.
+name: virgl-build
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - 'build/**'
+      - 'bin/**'
+      - 'lib/**'
+      - 'build.conf'
+      - 'licenses/**'
+      - 'LICENSE'
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build even if unchanged (space-separated: qemu virglrenderer mesa bundle)'
+        type: string
+        default: ''
+      dry_run:
+        description: 'Only check upstream and show what would be built'
+        type: boolean
+        default: false
+      deploy:
+        description: 'Redeploy the site even if nothing changed'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One run at a time, shared with rollback.yml. GitHub keeps one pending run per group: a newer one
+# cancels an older pending one, so a rollback queued behind a build may need running again.
+concurrency:
+  group: virgl-build
+  cancel-in-progress: false
+
+env:
+  VIRGL_STATE: ${{ github.workspace }}/_run/state
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      run: ${{ steps.plan.outputs.run }}
+      dry: ${{ steps.plan.outputs.dry }}
+      any: ${{ steps.plan.outputs.any }}
+      qemu: ${{ steps.plan.outputs.qemu }}
+      virglrenderer: ${{ steps.plan.outputs.virglrenderer }}
+      mesa: ${{ steps.plan.outputs.mesa }}
+      bundle: ${{ steps.plan.outputs.bundle }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: state
+          path: _run/state
+          persist-credentials: false
+      - id: plan
+        env:
+          VIRGL_FORCE: ${{ inputs.force }}
+          VIRGL_DRY: ${{ inputs.dry_run && '1' || '0' }}
+        run: bin/plan
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan
+          path: _run/plan/
+          retention-days: 1
+
+  build-qemu:
+    needs: plan
+    if: needs.plan.outputs.qemu == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      result: ${{ steps.build.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+          path: _run/plan
+      - name: Free disk (preinstalled toolchains the build doesn't use)
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+      - id: build
+        run: bin/build-one qemu
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: build-qemu
+          path: _run/out/qemu/
+          retention-days: 1
+      - name: Fail the job if the build failed
+        if: steps.build.outputs.result == 'failed'
+        run: exit 1
+
+  build-virglrenderer:
+    needs: plan
+    if: needs.plan.outputs.virglrenderer == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      result: ${{ steps.build.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+          path: _run/plan
+      - id: build
+        run: bin/build-one virglrenderer
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: build-virglrenderer
+          path: _run/out/virglrenderer/
+          retention-days: 1
+      - name: Fail the job if the build failed
+        if: steps.build.outputs.result == 'failed'
+        run: exit 1
+
+  build-mesa:
+    needs: plan
+    if: needs.plan.outputs.mesa == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      result: ${{ steps.build.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+          path: _run/plan
+      - id: build
+        run: bin/build-one mesa
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: build-mesa
+          path: _run/out/mesa/
+          retention-days: 1
+      - name: Fail the job if the build failed
+        if: steps.build.outputs.result == 'failed'
+        run: exit 1
+
+  build-bundle:
+    needs: [plan, build-mesa]
+    # From this run's Mesa if it built one (and only if that succeeded), else from the published Mesa.
+    if: >-
+      always() && needs.plan.outputs.bundle == '1' &&
+      (needs.plan.outputs.mesa != '1' || needs.build-mesa.outputs.result == 'ok')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      result: ${{ steps.build.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+          path: _run/plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.plan.outputs.mesa == '1'
+        with:
+          name: build-mesa
+          path: _run/out/mesa
+      - id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bin/build-one bundle
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: build-bundle
+          path: _run/out/bundle/
+          retention-days: 1
+      - name: Fail the job if the build failed
+        if: steps.build.outputs.result == 'failed'
+        run: exit 1
+
+  publish:
+    needs: [plan, build-qemu, build-virglrenderer, build-mesa, build-bundle]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.any == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: publish
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: state
+          path: _run/state
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+          path: _run/plan
+      # One download per product, by name: a pattern download of a single artifact unpacks it without
+      # its build-<product>/ folder (run 40554328523), so the layout would depend on how many were built.
+      # A missing artifact isn't fatal here: publish records that product as having no build result.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.build-qemu.result == 'success' || needs.build-qemu.result == 'failure'
+        continue-on-error: true
+        with:
+          name: build-qemu
+          path: _run/out/qemu
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.build-virglrenderer.result == 'success' || needs.build-virglrenderer.result == 'failure'
+        continue-on-error: true
+        with:
+          name: build-virglrenderer
+          path: _run/out/virglrenderer
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.build-mesa.result == 'success' || needs.build-mesa.result == 'failure'
+        continue-on-error: true
+        with:
+          name: build-mesa
+          path: _run/out/mesa
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.build-bundle.result == 'success' || needs.build-bundle.result == 'failure'
+        continue-on-error: true
+        with:
+          name: build-bundle
+          path: _run/out/bundle
+      - name: Builds in _run/out/<product>
+        run: |
+          mkdir -p _run/out
+          find _run/out -maxdepth 2 | sort
+      - name: Tools
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends aptly
+      - name: Signing key
+        env:
+          VIRGL_SIGNING_KEY: ${{ secrets.VIRGL_SIGNING_KEY }}
+        run: |
+          GNUPGHOME=$(mktemp -d)
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          printf '%s\n' "$VIRGL_SIGNING_KEY" | GNUPGHOME=$GNUPGHOME gpg --batch --import
+      - id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bin/publish
+      - name: Commit the state
+        if: always()
+        env:
+          RUN: ${{ needs.plan.outputs.run }}
+        run: |
+          bin/state-commit "publish: run $RUN"
+      - name: Forget the key
+        if: always()
+        run: |
+          gpgconf --kill gpg-agent || true
+          rm -rf "$GNUPGHOME"
+
+  site:
+    needs: [plan, publish]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.dry != '1'
+    uses: ./.github/workflows/site.yml
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    with:
+      deploy: ${{ inputs.deploy == true }}
+      publish-result: ${{ needs.publish.result }}

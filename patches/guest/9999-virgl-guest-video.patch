@@ -1,0 +1,167 @@
+Description: virgl video: NV12/P010-only codec surfaces, readback of decoded frames, 2D_ARRAY views for the compositor (local, not upstream)
+ For VA-API through virgl to a Proxmox host (virglrenderer + radeonsi), see
+ https://github.com/fvlaicu/pve-virgl-build (docs/DESIGN.md, "The problem").
+ .
+ 1. virgl_is_video_format_supported: for decode and encode entrypoints, offer only
+    NV12 and P010. virglrenderer allocates the host VA surface from the chroma
+    format alone (YUV420 -> NV12, YUV420_10 -> P010) and pairs guest and host
+    planes by index, so a guest buffer in I420/YV12 lost its V plane. ffmpeg
+    picks I420 for 8-bit decoding when offered (vaapi_decode_find_best_format).
+    radeonsi on bare metal offers only NV12/P010 too.
+ 2. virgl_video_end_frame: mark a decode target's plane resources dirty. The host
+    writes the decoded picture into them at END_FRAME; without this the guest
+    considers them clean and vaGetImage/hwdownload returned the guest's
+    never-written copy (flat frames).
+ 3. Component sampler views of video buffers get target 2D_ARRAY. The vl
+    compositor (scale_vaapi etc.; virgl has no video engine for it) samples them
+    with TGSI_TEXTURE_2D_ARRAY shaders while progressive buffers are 2D textures;
+    on the virgl host that sampler2DArray read zeros (scaled frames black). With
+    a 2D_ARRAY view the host makes a matching GL texture view.
+Author: local virgl build <root@localhost>
+Forwarded: not-needed
+Last-Update: 2026-10-16
+---
+--- a/src/gallium/drivers/virgl/virgl_screen.c	2026-10-16 21:46:17.377882881 +0300
++++ b/src/gallium/drivers/virgl/virgl_screen.c	2026-10-16 21:46:29.516044304 +0300
+@@ -771,6 +771,21 @@
+                                             enum pipe_video_profile profile,
+                                             enum pipe_video_entrypoint entrypoint)
+ {
++    /*
++     * Local patch: decode targets and encoder input are VA surfaces on the
++     * host, which virglrenderer allocates from the chroma format alone
++     * (VA_RT_FORMAT_YUV420 -> NV12, VA_RT_FORMAT_YUV420_10 -> P010), and its
++     * copies pair guest and host planes by index. A guest buffer in another
++     * layout (I420, YV12, ...) loses planes: ffmpeg picks I420 for 8-bit
++     * decoding when it is offered, and V came out all zero. So offer only
++     * those two for decoding and encoding, as radeonsi does on bare metal.
++     */
++    if (profile != PIPE_VIDEO_PROFILE_UNKNOWN &&
++        (entrypoint == PIPE_VIDEO_ENTRYPOINT_BITSTREAM ||
++         entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE) &&
++        format != PIPE_FORMAT_NV12 && format != PIPE_FORMAT_P010)
++        return false;
++
+     return vl_video_buffer_is_format_supported(screen, format, profile, entrypoint);
+ }
+ 
+--- a/src/gallium/drivers/virgl/virgl_video.c	2026-10-16 21:46:17.378201145 +0300
++++ b/src/gallium/drivers/virgl/virgl_video.c	2026-10-16 22:29:36.271936874 +0300
+@@ -69,6 +69,8 @@
+ 
+ #include "vl/vl_decoder.h"
+ #include "vl/vl_video_buffer.h"
++#include "util/u_sampler.h"
++#include "util/format/u_format.h"
+ #include "util/u_video.h"
+ #include "util/u_memory.h"
+ #include "util/macros.h"
+@@ -1111,6 +1113,20 @@
+     virgl_encode_end_frame(vctx, vcdc, vbuf);
+     virgl_flush_eq(vctx, vctx, NULL);
+ 
++    /*
++     * Local patch: at END_FRAME the host copies the decoded picture into the
++     * target's plane resources, a host-side write the guest doesn't see. Mark
++     * them dirty, as draws, blits and copies do, so a later map reads them
++     * back from the host instead of returning the guest's never-written copy
++     * (vaGetImage gave flat frames). The readback is queued after END_FRAME.
++     */
++    if (codec->entrypoint == PIPE_VIDEO_ENTRYPOINT_BITSTREAM && vbuf) {
++        for (unsigned i = 0; i < vbuf->num_planes; i++) {
++            if (vbuf->plane_views[i])
++                virgl_resource_dirty(virgl_resource(vbuf->plane_views[i]->texture), 0);
++        }
++    }
++
+     switch_buffer(vcdc);
+     return 0;
+ }
+@@ -1281,6 +1297,78 @@
+     (void)data;
+ }
+ 
++/*
++ * Local patch: the vl compositor (VA post-processing such as scale_vaapi;
++ * virgl has no video engine for it) reads a buffer's component views with
++ * TGSI_TEXTURE_2D_ARRAY shaders (create_frag_shader_yuv/weave), while
++ * progressive video buffers are plain 2D textures. Hardware drivers sample
++ * either way; on the virgl host the GLSL sampler2DArray finds no 2D_ARRAY
++ * texture bound and reads zeros, so scaled frames came out black. These are
++ * the views vl_video_buffer_sampler_view_components() makes, with target
++ * 2D_ARRAY (one layer), for which the host creates a GL texture view of that
++ * type (with VIRGL_CAP_TEXTURE_VIEW; without it nothing changes). Plane views
++ * stay 2D: vaPutSurface samples RGB planes with a 2D shader.
++ */
++static struct pipe_sampler_view **
++virgl_video_buffer_sampler_view_components(struct pipe_video_buffer *buffer)
++{
++    struct vl_video_buffer *buf = (struct vl_video_buffer *)buffer;
++    struct pipe_sampler_view sv_templ;
++    struct pipe_context *pipe = buf->base.context;
++    enum pipe_format sampler_format[VL_NUM_COMPONENTS];
++    const unsigned *plane_order;
++    unsigned i, j, component, num_planes;
++
++    vl_get_video_buffer_formats(pipe->screen, buf->base.buffer_format, sampler_format);
++    plane_order = vl_video_buffer_plane_order(buf->base.buffer_format);
++    num_planes = util_format_get_num_planes(buf->base.buffer_format);
++
++    for (component = 0, i = 0; i < num_planes; ++i) {
++        struct pipe_resource *res = buf->resources[plane_order[i]];
++        const struct util_format_description *desc = util_format_description(res->format);
++        unsigned nr_components = util_format_get_nr_components(res->format);
++        if (desc->layout == UTIL_FORMAT_LAYOUT_SUBSAMPLED)
++            nr_components = 3;
++
++        for (j = 0; j < nr_components && component < VL_NUM_COMPONENTS; ++j, ++component) {
++            unsigned pipe_swizzle;
++
++            if (buf->sampler_view_components[component])
++                continue;
++
++            memset(&sv_templ, 0, sizeof(sv_templ));
++            u_sampler_view_default_template(&sv_templ, res, sampler_format[plane_order[i]]);
++            if (sv_templ.target == PIPE_TEXTURE_2D && res->array_size == 1)
++                sv_templ.target = PIPE_TEXTURE_2D_ARRAY;
++            pipe_swizzle = (buf->base.buffer_format == PIPE_FORMAT_YUYV ||
++                            buf->base.buffer_format == PIPE_FORMAT_UYVY) ?
++                           (PIPE_SWIZZLE_X + j + 1) % 3 :
++                           (PIPE_SWIZZLE_X + j);
++            sv_templ.swizzle_r = sv_templ.swizzle_g = sv_templ.swizzle_b = pipe_swizzle;
++            sv_templ.swizzle_a = PIPE_SWIZZLE_1;
++
++            buf->sampler_view_components[component] = pipe->create_sampler_view(pipe, res, &sv_templ);
++            if (!buf->sampler_view_components[component])
++                goto error;
++        }
++    }
++
++    assert(component != 0);
++
++    for (i = component; i < VL_NUM_COMPONENTS; ++i)
++        buf->sampler_view_components[i] = buf->sampler_view_components[component - 1];
++
++    buf->num_sampler_view_components = component;
++
++    return buf->sampler_view_components;
++
++error:
++    for (i = 0; i < buf->num_sampler_view_components; ++i)
++        pipe->sampler_view_release(pipe, buf->sampler_view_components[i]);
++
++    return NULL;
++}
++
+ struct pipe_video_buffer *
+ virgl_video_create_buffer(struct pipe_context *ctx,
+                           const struct pipe_video_buffer *tmpl)
+@@ -1298,6 +1386,8 @@
+         return NULL;
+     }
+     vbuf->buf->destroy = virgl_video_destroy_buffer;
++    /* local patch: 2D_ARRAY component views, see above */
++    vbuf->buf->get_sampler_view_components = virgl_video_buffer_sampler_view_components;
+     vl_video_buffer_set_associated_data(vbuf->buf,
+             NULL, vbuf, virgl_video_destroy_buffer_associated_data);
+ 

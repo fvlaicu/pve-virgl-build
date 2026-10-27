@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# The publish job: takes the builds bin/plan decided ($PLAN/decisions, $OUT/<product>/<version>/),
+# verifies them again, and publishes what passed. The only job with the signing key ($GNUPGHOME)
+# and with write access. It changes only the state checkout and Releases; bin/site deploys Pages
+# from them afterwards.
+#   publish
+# Per product:
+#   qemu, virglrenderer   the debs go into a candidate (what's published plus these, KEEP versions
+#                         per package), staged, smoke-tested, then published with by-hash indexes;
+#                         the new dists/ goes into the state. If any step fails, the published repo
+#                         stays as it was.
+#   mesa                  a Release with the apks; from then on the bundles build from it
+#   bundle                a Release with the tarball; the state's bundle list, current.asc, SHA256SUMS
+# Every build gets a Release (tag <product>/<version>, at the commit that built it) before the
+# state names it. Every attempted build's number goes into the ledger and its result into
+# <product>.last, failures included (the plan's backoff reads it). The products are independent: a
+# failure in one doesn't keep the others from being published.
+# Exits 1 if anything failed, after writing the state; the job commits the state either way.
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+# shellcheck source=../lib/publish.sh
+. "$INFRA/lib/publish.sh"
+(( $# == 0 )) || die "usage: publish"
+dec=$PLAN/decisions
+[[ -f $dec ]] || die "no $dec (the plan job's artifact)"
+need_key
+mkdir -p "$STATE"
+cp "$PLAN/upstream" "$STATE/upstream"
+RUN=$(kv_get "$dec" run)
+FAILED=0
+declare -A RES=() WHY=() VER=()
+
+record() { # product ok|failed|deferred [note] → state/<p>.last
+    local p=$1 r=$2 note=${3:-} t fails=0
+    t=$(cat "$OUT/$p/${VER[$p]}/tuple" 2>/dev/null || kv_get "$dec" "${p}_tuple")
+    if [[ $r == failed ]]; then
+        if [[ $(kv_get "$STATE/$p.last" tuple) == "$t" ]]; then fails=$(kv_get "$STATE/$p.last" fails); fi
+        fails=$(( ${fails:-0} + 1 ))
+        FAILED=1
+    fi
+    kv_write "$STATE/$p.last" "tuple=$t" "version=${VER[$p]}" "result=$r" "note=$note" "at=$(date +%s)" "fails=$fails" "run=$RUN"
+    RES[$p]=$r WHY[$p]=$note
+    log "[$p] ${VER[$p]}: $r${note:+ ($note)}"
+}
+mark_published() { # product [key=value...] → state/<p>.published, and recorded ok
+    local p=$1
+    shift
+    kv_write "$STATE/$p.published" "tuple=$(cat "$OUT/$p/${VER[$p]}/tuple")" "version=${VER[$p]}" "at=$(date +%s)" "run=$RUN" "$@"
+    record "$p" ok
+}
+archive() { # product → its Release, with every file of the build; 1 if that failed
+    local p=$1 v=${VER[$1]} d=$OUT/$1/${VER[$1]}
+    local -a files=()
+    if release_exists "$p/$v"; then log "[$p] Release $p/$v exists already"; return 1; fi
+    release_notes "$p" "$v" "$d" > "$BASE/notes-$p.md"
+    mapfile -t files < <(find "$d" -maxdepth 1 -type f ! -name '.*' | sort)
+    release_create "$p/$v" "$p $v" "$BASE/notes-$p.md" "${files[@]}"
+}
+
+# --- what the builds left: the result each build job wrote, then verify again here
+attempted=()
+for p in "${PRODUCTS[@]}"; do
+    [[ $(kv_get "$dec" "$p") == 1 ]] || continue
+    v=$(kv_get "$dec" "${p}_version")
+    d=$OUT/$p/$v
+    r=$(cat "$d/result" 2>/dev/null || true)
+    if [[ $p == bundle && -z $r && $(kv_get "$dec" mesa) == 1 && $(cat "$OUT/mesa/${VER[mesa]}/result" 2>/dev/null) != ok ]]; then
+        # Never built: no version, so nothing below records it (ready() is false), no number used.
+        log "[bundle] not built: this run's Mesa build didn't succeed; the next run decides again"
+        continue
+    fi
+    VER[$p]=$v
+    attempted+=("$p")
+    base=$(kv_get "$dec" "${p}_base") n=$(kv_get "$dec" "${p}_n")
+    if ! awk -v p="$p" -v b="$base" -v n="$n" '$1 == p && $2 == b && $3 == n { f = 1 } END { exit !f }' "$LEDGER" 2>/dev/null; then
+        printf '%s %s %s %s\n' "$p" "$base" "$n" "$RUN" >> "$LEDGER"
+    fi
+    case $r in
+        ok)
+            if ! "$INFRA/bin/verify" "$p" "$d" "${VER[$p]}" > "$d/verify-publish.txt" 2>&1; then
+                grep '^FAIL' "$d/verify-publish.txt" | head -n 5 >&2 || true
+                record "$p" failed "verify in the publish job"
+            fi ;;
+        deferred*) record "$p" deferred "${r#deferred: }" ;;
+        failed*) record "$p" failed "${r#failed: }" ;;
+        *) record "$p" failed "no build result (the build job failed or was cancelled)" ;;
+    esac
+done
+ready() { [[ -n ${VER[$1]:-} && -z ${RES[$1]:-} ]]; }   # attempted, built, verified twice, not yet decided
+
+# --- debs
+debs=()
+for p in qemu virglrenderer; do ready "$p" && debs+=("$p"); done
+if (( ${#debs[@]} )); then
+    aptly_init
+    fetch_window "$BASE/window"
+    new=()
+    for p in "${debs[@]}"; do
+        for pkg in ${PUBLISH_PKGS[$p]}; do new+=("$OUT/$p/${VER[$p]}/${pkg}_${VER[$p]}_amd64.deb"); done
+    done
+    shopt -s nullglob
+    snapshot_of "$BASE"/window/*.deb "${new[@]}"
+    shopt -u nullglob
+    publish_snap "$STAGING_PREFIX" "$SNAP"
+    if ! smoke "$SNAP" > "$BASE/smoke.log" 2>&1; then
+        tail -n 20 "$BASE/smoke.log" >&2
+        for p in "${debs[@]}"; do cp "$BASE/smoke.log" "$OUT/$p/${VER[$p]}/smoke.log"; record "$p" failed "smoke test"; done
+    else
+        ok=1
+        for p in "${debs[@]}"; do
+            cp "$BASE/smoke.log" "$OUT/$p/${VER[$p]}/smoke.log"
+            archive "$p" || { ok=0; record "$p" failed "creating the Release"; }
+        done
+        if (( ok )); then
+            publish_snap "$APT_PATH" "$SNAP"
+            install_dists
+            for p in "${debs[@]}"; do mark_published "$p"; done
+        else
+            for p in "${debs[@]}"; do [[ -n ${RES[$p]:-} ]] || record "$p" failed "another product's Release failed; published together"; done
+        fi
+    fi
+fi
+
+# --- Mesa: archived, and the input of the bundles from now on
+if ready mesa; then
+    if archive mesa; then
+        mark_published mesa "alpine=$(kv_get "$OUT/mesa/${VER[mesa]}/info.txt" alpine_mesa)"
+    else
+        record mesa failed "creating the Release"
+    fi
+fi
+
+# --- the bundle
+if ready bundle; then
+    d=$OUT/bundle/${VER[bundle]}
+    if [[ $(kv_get "$dec" mesa) == 1 && ${RES[mesa]:-} != ok ]]; then
+        record bundle failed "its Mesa ${VER[mesa]} wasn't published"
+    elif ! archive bundle; then
+        record bundle failed "creating the Release"
+    else
+        name=${VER[bundle]}
+        { bundle_list | awk -v n="$name" '$1 != n'
+          echo "$name $(sha256sum "$d/$name.tar.gz" | cut -d' ' -f1) $(stat -c %s "$d/$name.tar.gz")"
+        } | tail -n "$KEEP_BUNDLES" | bundle_list_set
+        bundle_index "$name"
+        cp "$d/MANIFEST" "$STATE/bundle.MANIFEST"
+        mark_published bundle
+    fi
+fi
+
+{
+    echo "### virgl builds: publish, run $RUN"
+    echo
+    echo "| Product | Version | Result |"
+    echo "|---|---|---|"
+    for p in "${attempted[@]}"; do printf '| %s | %s | %s |\n' "$p" "${VER[$p]}" "${RES[$p]:-?}${WHY[$p]:+: ${WHY[$p]}}"; done
+} | gh_summary
+exit "$FAILED"

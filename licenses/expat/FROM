@@ -1,0 +1,5 @@
+origin=expat
+aports=main/expat at 2715415e33c4d23ee945e9f0f5d8d93b36b0fe01 (3.22-stable)
+version=2.9.0-r0
+collected=2026-10-27 by bin/collect-licenses
+file=COPYING from expat-2.9.0.tar.xz:expat-2.9.0/COPYING sha512=677b5a39ea47aa238813412061eefba0ff2e819597efee69452eab7fd63b1387537eda0dfd4e5891b938be202dc87df4b5115bdae75c6b81643ac2363bb99b34

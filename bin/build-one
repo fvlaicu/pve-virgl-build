@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# One build job: builds the product bin/plan decided ($PLAN/decisions) in a throwaway podman
+# container and checks it with bin/verify. No secrets, nothing published.
+#   build-one <qemu|virglrenderer|mesa|bundle>
+# Output: $OUT/<product>/<version>/ with the packages, build.log, podman.log, verify.txt, tuple,
+# image, run, resources.txt and result ("ok", "failed: <why>" or "deferred: <why>"). Exits 0 once
+# it has a result, so the job can upload the logs either way; result=ok|failed|deferred also goes
+# to the job outputs. The bundle takes our Mesa from $OUT/mesa/<version> when Mesa was built in the
+# same run (the mesa job's artifact), else from the published Mesa's Release.
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+(( $# == 1 )) && [[ $1 =~ ^(qemu|virglrenderer|mesa|bundle)$ ]] || die "usage: build-one <qemu|virglrenderer|mesa|bundle>"
+p=$1
+dec=$PLAN/decisions
+[[ $(kv_get "$dec" "$p") == 1 ]] || die "the plan doesn't build $p ($dec)"
+v=$(kv_get "$dec" "${p}_version") n=$(kv_get "$dec" "${p}_n") base=$(kv_get "$dec" "${p}_base")
+t=$(kv_get "$dec" "${p}_tuple") run=$(kv_get "$dec" run)
+d=$OUT/$p/$v
+rm -rf "$d" "$WORK/$p/out"
+mkdir -p "$d" "$WORK/$p/out"
+printf '%s\n' "$t" > "$d/tuple"
+echo "$run" > "$d/run"
+
+result() { # ok|failed|deferred [why] → the result file and the job output; exits 0
+    echo "$1${2:+: $2}" > "$d/result"
+    gh_output "result=$1" "version=$v"
+    log "[$p] $v: $1${2:+ ($2)}"
+    exit 0
+}
+
+# Peak memory in use (MemTotal - MemAvailable) and disk, for the plan's "Not verified" sizes. The
+# runner is a VM with nothing else running, so the whole machine's figures are the build's.
+disk() { df -Pk "$BASE" | awk 'NR == 2 { printf "%d MiB used, %d MiB free", $3 / 1024, $4 / 1024 }'; }
+echo "disk before: $(disk)" > "$d/resources.txt"
+(
+    peak=0
+    while :; do
+        used=$(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { print int((t - a) / 1024) }' /proc/meminfo)
+        (( used <= peak )) || { peak=$used; echo "$peak" > "$d/.mem-peak"; }
+        sleep 5
+    done
+) &
+sampler=$!
+started=$(date +%s)
+# shellcheck disable=SC2329  # the EXIT trap calls it
+finish_resources() {
+    kill "$sampler" 2>/dev/null || true
+    {
+        echo "disk after: $(disk)"
+        echo "memory in use, peak: $(cat "$d/.mem-peak" 2>/dev/null || echo ?) MiB of $(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo) MiB"
+        echo "wall time: $(( $(date +%s) - started )) s, $(nproc) CPUs"
+    } >> "$d/resources.txt"
+    rm -f "$d/.mem-peak"
+}
+trap finish_resources EXIT
+
+run_container() { # image [podman options] -- command... → the container's exit code
+    local image=$1
+    local -a opts=()
+    shift
+    while [[ $1 != -- ]]; do opts+=("$1"); shift; done
+    shift
+    podman pull -q "$image" >/dev/null 2>&1 || log "[$p] pulling $image failed; using the local image"
+    podman image inspect --format '{{.Digest}}' "$image" > "$d/image" 2>/dev/null || true
+    mkdir -p "$KEYRINGS"   # mounted for every build; on a fresh runner only the qemu job has made it
+    podman run --rm --security-opt label=disable \
+        -v "$INFRA":/infra:ro -v "$KEYRINGS":/keyrings:ro -v "$WORK/$p":/work -w /work \
+        -e JOBS="$(nproc)" -e DEBFULLNAME="$DEBFULLNAME" -e DEBEMAIL="$DEBEMAIL" \
+        "${opts[@]}" "$image" "$@"
+}
+verify() {
+    cp -a "$WORK/$p/out/." "$d/"
+    "$INFRA/bin/verify" "$p" "$d" "$v" > "$d/verify.txt" 2>&1 && return 0
+    grep '^FAIL' "$d/verify.txt" | head -n 5 >&2 || true
+    return 1
+}
+
+rc=0
+log "[$p] building $v"
+case $p in
+qemu|virglrenderer)
+    [[ $p != qemu ]] || ensure_proxmox_keyring || result failed "no verified Proxmox keyring"
+    run_container "$IMAGE_DEBIAN" -e VERSION="$base" -e SUFFIX="virgl$n" -e TRACK_SUITE="$TRACK_SUITE" \
+        -- bash "/infra/build/build-$p.sh" > "$d/podman.log" 2>&1 || rc=$?
+    ;;
+mesa)
+    run_container "$IMAGE_ALPINE" -e ALPINE_BRANCH="$ALPINE_BRANCH" -e MESA_VERSION="$(kv_get "$PLAN/upstream" mesa_alpine)" \
+        -e PKGREL=$((100 + n)) -e APORTS_URL="$APORTS_URL" \
+        -- sh /infra/build/build-alpine-mesa.sh > "$d/podman.log" 2>&1 || rc=$?
+    if (( rc == 75 )); then cp -a "$WORK/$p/out/." "$d/"; result deferred "aports and the index disagree; next run"; fi
+    ;;
+bundle)
+    mesa=$(kv_get "$dec" bundle_mesa)
+    apks=$WORK/bundle/mesa-apks
+    rm -rf "$apks"
+    mkdir -p "$apks"
+    for f in "mesa-$mesa.apk" "mesa-va-gallium-$mesa.apk" info.txt; do
+        if [[ $(kv_get "$dec" mesa) == 1 ]]; then
+            cp "$OUT/mesa/$mesa/$f" "$apks/" || result failed "this run's Mesa $mesa has no $f"
+        else
+            release_get "mesa/$mesa" "$f" "$apks/$f" || result failed "can't download $f from Release mesa/$mesa"
+        fi
+    done
+    run_container "$IMAGE_ALPINE" -e NAME="$v" -e MESA_APKS=/work/mesa-apks -e PLEX_LIBVA_MINOR="$PLEX_LIBVA_MINOR" \
+        -e BUNDLE_SOURCE_ORIGINS="$BUNDLE_SOURCE_ORIGINS" -e APORTS_URL="$APORTS_URL" -e ALPINE_DISTFILES="$ALPINE_DISTFILES" -e REPO="$REPO" \
+        -- sh /infra/build/make-musl-va.sh > "$d/podman.log" 2>&1 || rc=$?
+    ;;
+esac
+if (( rc != 0 )); then cp -a "$WORK/$p/out/." "$d/" 2>/dev/null || true; result failed "build exit $rc"; fi
+verify || result failed "verify"
+if [[ $p == bundle ]]; then
+    # The tuple for the next comparison: the Alpine versions this build actually used. check-upstream
+    # asks the index for the same packages, so an update to any of them changes the tuple.
+    echo "mesa=$mesa libs=$(awk '$1 == "owner" && $4 == "index" { print $2, $3 }' "$d/MANIFEST" | libs_hash) script=$(hash_of "$INFRA/build/make-musl-va.sh") libva_minor=$PLEX_LIBVA_MINOR sources=$(bundle_sources_key) licenses=$(licenses_key)" > "$d/tuple"
+fi
+result ok

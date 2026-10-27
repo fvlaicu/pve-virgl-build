@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# The whole workflow (.github/workflows/virgl-build.yml) on one machine, for testing without
+# GitHub: plan → build-one for each decided product (the bundle after Mesa) → publish → site. Uses
+# the same scripts in the same order; Releases go to a directory and the site stays in $SITE.
+#   VIRGL_RELEASES=<dir> GNUPGHOME=<test key> virgl-build [--dry-run] [--force <product>]...
+# Needs podman, aptly, gpg and dpkg on the machine (or in the container it runs in). Nothing is
+# committed: the state is a plain directory ($STATE).
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+releases_local || die "set VIRGL_RELEASES to a directory: this driver never touches GitHub"
+"$INFRA/bin/plan" "$@" >/dev/null
+dec=$PLAN/decisions
+[[ $(kv_get "$dec" dry) == 0 ]] || { cat "$dec"; exit 0; }
+for p in qemu virglrenderer mesa bundle; do
+    [[ $(kv_get "$dec" "$p") == 1 ]] || continue
+    if [[ $p == bundle && $(kv_get "$dec" mesa) == 1 ]] &&
+       [[ $(cat "$OUT/mesa/$(kv_get "$dec" mesa_version)/result" 2>/dev/null) != ok ]]; then
+        log "[bundle] skipped: this run's Mesa build didn't succeed"
+        continue
+    fi
+    "$INFRA/bin/build-one" "$p"
+done
+rc=0
+if [[ $(kv_get "$dec" any) == 1 ]]; then
+    "$INFRA/bin/publish" || rc=$?
+    VIRGL_PUBLISH_RESULT=$( (( rc == 0 )) && echo success || echo failure)
+    export VIRGL_PUBLISH_RESULT
+fi
+"$INFRA/bin/site" || rc=1
+"$INFRA/bin/state-commit" "local run $(kv_get "$dec" run)"
+exit "$rc"

@@ -1,0 +1,5 @@
+origin=libbsd
+aports=main/libbsd at 2715415e33c4d23ee945e9f0f5d8d93b36b0fe01 (3.22-stable)
+version=0.12.2-r0
+collected=2026-10-27 by bin/collect-licenses
+file=COPYING from libbsd-0.12.2.tar.xz:libbsd-0.12.2/COPYING sha512=ce43e4f0486d5f00d4a8119ee863eaaa2f968cae4aa3d622976bb31ad601dfc565afacef7ebade5eba33fff1c329b5296c6387c008d1e1805d878431038f8b21

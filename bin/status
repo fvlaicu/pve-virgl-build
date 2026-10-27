@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# Writes the status page from the state files into the site: $SITE/files/status/ index.html,
+# status.txt, status.json (read by the nodes' apt check: "generated" is when the page was written)
+# and status.key (the same facts without times, which bin/site hashes to decide whether to
+# redeploy). bin/site runs it; it only reads the state, so it can run any time.
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+out=$SITE/files/status
+mkdir -p "$out"
+now=$(date +%s)
+up=$STATE/upstream
+
+when() { # epoch → "2026-10-20 14:05 UTC (3 h ago)"
+    [[ -n ${1:-} ]] || { echo "-"; return 0; }
+    local a=$(( now - $1 )) ago
+    if (( a < 3600 )); then ago="$((a / 60)) min ago"
+    elif (( a < 172800 )); then ago="$((a / 3600)) h ago"
+    else ago="$((a / 86400)) days ago"
+    fi
+    echo "$(date -u -d "@$1" '+%F %H:%M') UTC ($ago)"
+}
+label() {
+    case $1 in
+        qemu) echo "pve-qemu-kvm (Proxmox $TRACK_SUITE)" ;;
+        virglrenderer) echo "libvirglrenderer1, virgl-server (Debian $DIST)" ;;
+        mesa) echo "guest Mesa (Alpine $ALPINE_BRANCH), the bundle's input" ;;
+        bundle) echo "Plex VA bundle" ;;
+    esac
+}
+upstream_of() {
+    case $1 in
+        qemu) kv_get "$up" qemu_base ;;
+        virglrenderer) kv_get "$up" virglrenderer_base ;;
+        mesa) kv_get "$up" mesa_alpine ;;
+        bundle) echo "Alpine $ALPINE_BRANCH packages" ;;
+    esac
+}
+state_of() { # product → "<class>|<text>"; class is ok, warn or bad
+    local p=$1 t last
+    t=$(tuple_of "$p")
+    last=$STATE/$p.last
+    if [[ -z $t ]]; then
+        echo "warn|upstream unknown: $(why_unknown "$p")"
+    elif [[ $t == "$(kv_get "$STATE/$p.published" tuple)" ]]; then
+        echo "ok|current"
+    elif grep -qxF "$t" "$STATE/$p.rejected" 2>/dev/null; then
+        echo "warn|held: these inputs were rolled back; the next input change builds anew"
+    elif [[ $(kv_get "$last" tuple) == "$t" && $(kv_get "$last" result) == failed ]]; then
+        echo "bad|failing: $(kv_get "$last" fails)x with the current inputs ($(kv_get "$last" note)); behind since $(when "$(cat "$STATE/$p.ahead" 2>/dev/null || true)")"
+    else
+        echo "warn|behind since $(when "$(cat "$STATE/$p.ahead" 2>/dev/null || true)"); the next run builds it"
+    fi
+}
+json() { # text → a JSON string
+    printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\t\n' '  ')"
+}
+
+US=$'\x1f'   # field separator in rows: never part of a version, note or message
+rows=()      # product, label, published, since, upstream, last build, state class, state text
+key=()       # status.key: the facts without times
+overall=ok
+for p in "${PRODUCTS[@]}"; do
+    s=$(state_of "$p")
+    [[ ${s%%|*} == ok ]] || overall=attention
+    lb="-" lk="-"
+    if [[ -f $STATE/$p.last ]]; then
+        lk="$(kv_get "$STATE/$p.last" version): $(kv_get "$STATE/$p.last" result)"
+        n=$(kv_get "$STATE/$p.last" note)
+        [[ -z $n ]] || lk+=" ($n)"
+        lb="$lk, $(when "$(kv_get "$STATE/$p.last" at)")"
+    fi
+    pv=$(kv_get "$STATE/$p.published" version)
+    rows+=("$p$US$(label "$p")$US$pv$US$(when "$(kv_get "$STATE/$p.published" at)")$US$(upstream_of "$p")$US$lb$US${s%%|*}$US${s#*|}")
+    key+=("$p published=$pv upstream=$(upstream_of "$p") last=$lk state=${s%%|*}")
+done
+
+notes=()
+if ! [[ $(date -u +%F) < "$ALPINE_EOL_WARN" ]]; then
+    notes+=("Alpine $ALPINE_BRANCH reaches end of life on $ALPINE_EOL. Move the guest build to the next branch (docs/DESIGN.md, \"Later: newer bases\"); check the libva minor against Plex's first.")
+    overall=attention
+fi
+serial=$(sed -n 's/^Serial: //p' "$BUNDLE_FILES/current.asc" 2>/dev/null || true)
+cur=$(sed -n 's/^Bundle: //p' "$BUNDLE_FILES/current.asc" 2>/dev/null || true)
+key+=("bundle=${cur:--} notes=${#notes[@]} overall=$overall")
+gh=https://github.com/$REPO
+info=(
+    "Last run: started $(kv_get "$STATE/run" started), finished $(kv_get "$STATE/run" finished)$( [[ $(kv_get "$STATE/run" failed) == 1 ]] && echo ', with failures' || true). Upstream checked $(kv_get "$up" checked)."
+    "Current bundle: ${cur:--} (serial ${serial:--})."
+    "Newest upstream releases (information only): virglrenderer $(kv_get "$up" virglrenderer_tag), Mesa $(kv_get "$up" mesa_tag)."
+)
+todo=(
+    "After a host package is published: on opted-in nodes run apt update and apt full-upgrade, then reboot the node (or restart its virtio-gl VMs)."
+    "After a bundle is published: the Plex container takes it at its next start (docker compose pull && docker compose up -d, or docker restart plex)."
+    "Logs: $gh/actions. Every published build, with its packages, logs and verify results: $gh/releases."
+)
+
+# --- status.key, status.txt
+printf '%s\n' "${key[@]}" > "$out/status.key"
+{
+    echo "virgl builds: $overall ($(date -u '+%F %H:%M') UTC)"
+    echo
+    for r in "${rows[@]}"; do
+        IFS=$US read -r _ l pv ps us lbuild _ st <<<"$r"
+        echo "$l"
+        echo "  published: ${pv:--} ($ps)"
+        echo "  upstream:  ${us:--}"
+        echo "  last:      $lbuild"
+        echo "  state:     $st"
+    done
+    echo
+    printf '%s\n' "${notes[@]}" "${info[@]}" "" "${todo[@]}"
+} > "$out/status.txt"
+
+# --- status.json
+{
+    printf '{\n  "generated": %s,\n  "checked": %s,\n  "overall": %s,\n  "bundle": %s,\n  "products": {\n' \
+        "$now" "$(json "$(kv_get "$up" checked)")" "$(json "$overall")" "$(json "${cur:-}")"
+    i=0
+    for r in "${rows[@]}"; do
+        IFS=$US read -r p _ pv _ us _ sc st <<<"$r"
+        i=$((i + 1))
+        printf '    %s: {"published": %s, "upstream": %s, "state": %s, "text": %s}%s\n' "$(json "$p")" "$(json "$pv")" \
+            "$(json "$us")" "$(json "$sc")" "$(json "$st")" "$( (( i < ${#rows[@]} )) && echo , || true)"
+    done
+    printf '  }\n}\n'
+} > "$out/status.json"
+
+# --- index.html
+esc() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+{
+    cat <<'EOF'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>virgl builds</title>
+<style>
+:root { --bg: #fff; --fg: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; }
+@media (prefers-color-scheme: dark) { :root { --bg: #161618; --fg: #f2f2f2; --muted: #a1a1a6; --line: #3a3a3c; --ok: #3fb950; --warn: #d29922; --bad: #f85149; } }
+body { background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 70rem; padding: 1.5rem 1rem; }
+h1 { font-size: 1.4rem; margin: 0 0 .25rem; } p.sub { color: var(--muted); margin: 0 0 1.5rem; }
+.wrap { overflow-x: auto; } table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid var(--line); padding: .5rem .6rem; text-align: left; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: .85rem; } code { font-size: .9em; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .state { font-weight: 600; }
+ul { padding-left: 1.2rem; } li { margin: .3rem 0; } a { color: inherit; }
+</style></head><body>
+EOF
+    cls=ok
+    [[ $overall == ok ]] || cls=warn
+    echo "<h1>virgl builds: <span class=\"$cls\">$overall</span></h1>"
+    echo "<p class=\"sub\">Written $(date -u '+%F %H:%M') UTC by bin/status. Plain text: <a href=\"status.txt\">status.txt</a>, <a href=\"status.json\">status.json</a>. Bundles: <a href=\"../plex-vaapi/SHA256SUMS\">/files/plex-vaapi/</a>. <a href=\"$(esc <<<"$gh")/actions\">Runs</a>, <a href=\"$(esc <<<"$gh")/releases\">Releases</a>.</p>"
+    echo '<div class="wrap"><table><tr><th>Product</th><th>Published</th><th>Upstream</th><th>Last build</th><th>State</th></tr>'
+    for r in "${rows[@]}"; do
+        IFS=$US read -r _ l pv ps us lbuild sc st <<<"$r"
+        printf '<tr><td>%s</td><td><code>%s</code><br><small>%s</small></td><td><code>%s</code></td><td>%s</td><td class="state %s">%s</td></tr>\n' \
+            "$(esc <<<"$l")" "$(esc <<<"${pv:--}")" "$(esc <<<"$ps")" "$(esc <<<"${us:--}")" "$(esc <<<"$lbuild")" "$sc" "$(esc <<<"$st")"
+    done
+    echo '</table></div>'
+    if (( ${#notes[@]} )); then
+        echo '<h2>Needs attention</h2><ul>'
+        for n in "${notes[@]}"; do echo "<li class=\"warn\">$(esc <<<"$n")</li>"; done
+        echo '</ul>'
+    fi
+    echo '<h2>Details</h2><ul>'
+    for n in "${info[@]}"; do echo "<li>$(esc <<<"$n")</li>"; done
+    echo '</ul><h2>What to do</h2><ul>'
+    for n in "${todo[@]}"; do echo "<li>$(esc <<<"$n")</li>"; done
+    echo '</ul></body></html>'
+} > "$out/index.html"

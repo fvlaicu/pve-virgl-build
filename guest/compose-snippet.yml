@@ -1,0 +1,20 @@
+# The Plex service's additions for the VA bundle (docs/DESIGN.md, "Plex"); merge into the existing
+# service. One-time setup in the Plex VM, as root, from a checkout of the infra repo:
+#   install -d -m 0755 /opt/plex-vaapi/store
+#   install -m 0644 guest/pve-virgl.gpg /opt/plex-vaapi/pve-virgl.gpg
+#   install -m 0755 guest/plex-musl-va-init.sh /opt/plex-vaapi/plex-musl-va-init.sh
+# The key and the script sit beside the store, not in it: the container gets the store read-write,
+# and its root mustn't be able to change its own init script or the key it trusts.
+# Updates: docker compose pull && docker compose up -d, or docker restart plex. Each start checks
+# for a newer bundle.
+services:
+  plex:
+    devices:
+      - /dev/dri:/dev/dri
+    # Hold a bundle (rollback, or to stay put): a name from /opt/plex-vaapi/store.
+    # environment:
+    #   - PLEX_VAAPI_BUNDLE=plex-vaapi_alpine3.22_mesa25.1.9-r0_virgl4
+    volumes:
+      - /opt/plex-vaapi/store:/vaapi-store
+      - /opt/plex-vaapi/pve-virgl.gpg:/etc/pve-virgl.gpg:ro
+      - /opt/plex-vaapi/plex-musl-va-init.sh:/custom-cont-init.d/90-plex-musl-va:ro

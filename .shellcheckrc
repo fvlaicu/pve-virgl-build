@@ -1,0 +1,3 @@
+# make lint: follow the sourced lib/common.sh and build.conf from each script's directory
+source-path=SCRIPTDIR
+external-sources=true

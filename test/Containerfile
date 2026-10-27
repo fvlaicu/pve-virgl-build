@@ -1,0 +1,10 @@
+# The GitHub runner's userland for local tests (test/run.sh): Ubuntu 24.04 with the same podman
+# (4.9.3) and aptly (1.5.0) the workflow uses, plus what the runner image has preinstalled and the
+# scripts need. podman runs nested, as root inside this container, on vfs storage.
+FROM docker.io/library/ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        podman passt uidmap fuse-overlayfs aptly gnupg curl ca-certificates git dpkg-dev binutils \
+        zstd xz-utils file jq make shellcheck \
+    && rm -rf /var/lib/apt/lists/* \
+    && printf '[storage]\ndriver = "vfs"\nrunroot = "/run/containers/storage"\ngraphroot = "/var/lib/containers/storage"\n' > /etc/containers/storage.conf \
+    && printf '[containers]\nnetns = "host"\ncgroupns = "host"\n[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' > /etc/containers/containers.conf

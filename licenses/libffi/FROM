@@ -1,0 +1,5 @@
+origin=libffi
+aports=main/libffi at 2715415e33c4d23ee945e9f0f5d8d93b36b0fe01 (3.22-stable)
+version=3.4.8-r0
+collected=2026-10-27 by bin/collect-licenses
+file=LICENSE from libffi-3.4.8.tar.gz:libffi-3.4.8/LICENSE sha512=05344c6c1a1a5b44704f6cf99277098d1ea3ac1dc11c2a691c501786a214f76184ec0637135588630db609ce79e49df3dbd00282dd61e7f21137afba70e24ffe

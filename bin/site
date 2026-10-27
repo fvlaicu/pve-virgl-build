@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# The site job: records the run in the state, writes the status page, and assembles the Pages site
+# in $SITE when there is something new to serve. No key: the signed files come from the state
+# (site/), the big ones from their Releases.
+#   site [--deploy]     --deploy (or VIRGL_FORCE_DEPLOY=1) assembles the site whatever changed
+# The site is assembled, and job output deploy=1 set, when the site's content (the state's signed
+# files, the bundle list, status.key) differs from what the live site says it serves, or when the
+# live status.json is older than DEPLOY_MAX_AGE, so that the nodes' staleness check only fires when
+# runs have really stopped.
+# Environment: VIRGL_PUBLISH_RESULT (the publish job's result: success, failure, skipped).
+# The served tree:
+#   apt/virgl/{dists,pool}/       dists from the state, pool from the debs' Releases
+#   files/plex-vaapi/             current.asc, SHA256SUMS (state), <name>.tar.gz + .MANIFEST (Releases)
+#   files/status/                 index.html, status.txt, status.json, status.key, site-hash
+#   index.html                    → files/status/
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+force=${VIRGL_FORCE_DEPLOY:-0}
+[[ $force == 1 || $force == true ]] && force=1 || force=0
+case ${1:-} in
+    --deploy) force=1 ;;
+    '') ;;
+    *) die "usage: site [--deploy]" ;;
+esac
+live=${VIRGL_LIVE_URL:-$PAGES_URL}
+mkdir -p "$STATE"
+now=$(date +%s)
+
+# --- the run, the upstream facts and the "behind since" times
+state_gitignore
+if [[ -f $PLAN/upstream ]]; then cp "$PLAN/upstream" "$STATE/upstream"; fi
+kv_write "$STATE/run" "started=$(kv_get "$PLAN/decisions" run)" "finished=$(date -u +%Y%m%dT%H%M%SZ)" \
+    "failed=$([[ ${VIRGL_PUBLISH_RESULT:-} == failure ]] && echo 1 || echo 0)"
+for p in "${PRODUCTS[@]}"; do
+    t=$(tuple_of "$p")
+    if [[ -n $t && $t != "$(kv_get "$STATE/$p.published" tuple)" ]]; then
+        [[ -f $STATE/$p.ahead ]] || echo "$now" > "$STATE/$p.ahead"
+    else
+        rm -f "$STATE/$p.ahead"
+    fi
+done
+date -u +%F > "$STATE/heartbeat"   # at most one state commit a day when nothing else changes
+
+# --- the status page, and whether the site changed
+rm -rf "$SITE"
+mkdir -p "$SITE"
+"$INFRA/bin/status"
+hash=$( { [[ ! -d $SITE_STATE ]] || (cd "$SITE_STATE" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum)
+          [[ ! -f $STATE/bundles ]] || cat "$STATE/bundles"
+          cat "$SITE/files/status/status.key"; } | sha256sum | cut -c1-16)
+echo "$hash" > "$SITE/files/status/site-hash"
+live_hash=$(curl -fsS --max-time 20 "$live/files/status/site-hash" 2>/dev/null || true)
+live_gen=$(curl -fsS --max-time 20 "$live/files/status/status.json" 2>/dev/null | sed -n 's/^ *"generated": *\([0-9]*\),*$/\1/p' || true)
+why=""
+if (( force )); then why="asked for"
+elif [[ $live_hash != "$hash" ]]; then why="content changed (live ${live_hash:-unreachable or empty}, now $hash)"
+elif [[ -z $live_gen ]] || (( now - live_gen > DEPLOY_MAX_AGE )); then why="live status.json is older than $DEPLOY_MAX_AGE s"
+fi
+if [[ -z $why ]]; then
+    log "[site] unchanged ($hash); not deployed"
+    gh_output deploy=0
+    rm -rf "$SITE"
+    exit 0
+fi
+log "[site] assembling: $why"
+
+# --- the served tree
+[[ ! -d $SITE_STATE ]] || cp -a "$SITE_STATE/." "$SITE/"
+while read -r pkg v f; do
+    prod=$(pkg_product "$pkg")
+    mkdir -p "$SITE/$APT_PATH/$(dirname "$f")"
+    release_get "$prod/$v" "${f##*/}" "$SITE/$APT_PATH/$f" || die "can't download ${f##*/} from Release $prod/$v"
+done < <(window)
+if [[ -f $STATE/bundles ]]; then
+    mkdir -p "$SITE/files/plex-vaapi"
+    while read -r name sha _; do
+        release_get "bundle/$name" "$name.tar.gz" "$SITE/files/plex-vaapi/$name.tar.gz" || die "can't download $name.tar.gz from its Release"
+        echo "$sha  $SITE/files/plex-vaapi/$name.tar.gz" | sha256sum -c --quiet - || die "$name.tar.gz from its Release doesn't match the state's sha256"
+        release_get "bundle/$name" MANIFEST "$SITE/files/plex-vaapi/$name.MANIFEST" || die "can't download $name's MANIFEST"
+    done < "$STATE/bundles"
+fi
+cat > "$SITE/index.html" <<'EOF'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=files/status/">
+<title>virgl builds</title></head><body><a href="files/status/">virgl builds: status</a></body></html>
+EOF
+touch "$SITE/.nojekyll"
+# Pages' upload follows links, and a link from one runner means nothing on another.
+if [[ -n $(find "$SITE" -type l) ]]; then die "the site has links: $(find "$SITE" -type l | head -n 3)"; fi
+size=$(du -sb "$SITE" | cut -f1)
+(( size < 1000000000 )) || die "the site is $size bytes; Pages allows 1 GB (lower KEEP or KEEP_BUNDLES)"
+log "[site] $(( size / 1048576 )) MiB, $(find "$SITE" -type f | wc -l) files"
+gh_output deploy=1
+printf '### virgl builds: site\n\nDeployed (%s): %d MiB, site-hash %s.\n' "$why" "$(( size / 1048576 ))" "$hash" | gh_summary

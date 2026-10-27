@@ -1,0 +1,669 @@
+Description: virgl video fixes for VA-API through virgl on AMD (local, not upstream)
+ For a Proxmox host (QEMU virtio-gpu-gl, Mesa radeonsi VA) serving guests that use
+ Mesa's virgl VA driver; details in https://github.com/fvlaicu/pve-virgl-build
+ (docs/DESIGN.md, "The problem"). Needs the guest patch 9999-virgl-guest-video.patch
+ (Mesa) for decode readback and scaling.
+ .
+ 1. virgl_video_dma_buf_plane.modifier is 64-bit (was int, truncating DRM modifiers),
+    and the EGL dmabuf imports pass it when EGL_EXT_image_dma_buf_import_modifiers
+    is there (upstream imports without it, right only for linear surfaces).
+ 2. Video buffers are exported READ_WRITE. The export is cached per buffer, so a
+    decoded buffer fed to the encoder kept its read-only export and the upload was
+    refused ("dmabuf is not writable").
+ 3. glFinish() after a guest frame is copied into the VA surface, before the VA
+    encoder reads it through the dmabuf.
+ 4. H.264 encode: SPS/PPS for each IDR and a slice header for every picture are
+    written from the picture description and sent as VAEncPackedHeader buffers.
+    Host Mesa >= 24.3 takes the NAL header byte, frame_num, idr_pic_id, POC lsb,
+    reference list modifications and marking only from packed headers, and writes
+    SPS/PPS into the stream only when it got packed ones; without this every slice
+    had NAL header 0x00 and frame_num 0. Level and max_num_ref_frames are chosen
+    from frame size, rate and bitrate (the guest sends level 0 and 16 references);
+    frame_num/POC lsb lengths are 8 bits, as ffmpeg's. HEVC is not handled.
+Author: local virgl build <root@localhost>
+Forwarded: not-needed
+Last-Update: 2026-10-16
+---
+--- a/src/virgl_video.h	2026-10-16 23:16:35.644132346 +0300
++++ b/src/virgl_video.h	2026-10-16 23:16:35.667772589 +0300
+@@ -93,7 +93,7 @@
+         uint32_t drm_format;
+         int fd;
+         uint32_t size;
+-        int modifier;
++        uint64_t modifier; /* local patch: was int, which truncated 64-bit DRM modifiers */
+         uint32_t offset;
+         uint32_t pitch;
+     } planes[4];
+--- a/src/virgl_video.c	2026-10-16 23:16:35.643924794 +0300
++++ b/src/virgl_video.c	2026-10-16 23:16:44.590854966 +0300
+@@ -453,7 +453,8 @@
+     }
+ 
+     if (!buffer->dmabuf)
+-        buffer->dmabuf = export_video_dma_buf(buffer, VIRGL_VIDEO_DMABUF_WRITE_ONLY);
++        /* local patch: READ_WRITE, see decode_completed() */
++        buffer->dmabuf = export_video_dma_buf(buffer, VIRGL_VIDEO_DMABUF_READ_WRITE);
+ 
+     if (buffer->dmabuf)
+         callbacks->encode_upload_picture(codec, buffer->dmabuf);
+@@ -508,7 +509,12 @@
+         return;
+ 
+     if (!buffer->dmabuf)
+-        buffer->dmabuf = export_video_dma_buf(buffer, VIRGL_VIDEO_DMABUF_READ_ONLY);
++        /*
++         * Local patch: the export is cached on the buffer for its lifetime, and a
++         * decoded buffer can then feed the encoder (hw decode -> hw encode), whose
++         * upload refused a read-only export ("dmabuf is not writable").
++         */
++        buffer->dmabuf = export_video_dma_buf(buffer, VIRGL_VIDEO_DMABUF_READ_WRITE);
+ 
+     if (buffer->dmabuf)
+         callbacks->decode_completed(codec, buffer->dmabuf);
+@@ -1237,6 +1243,16 @@
+ }
+ 
+ /*
++ * Local patch (9999-virgl-video-h264-packed-headers.patch), not upstream.
++ * frame_num and pic_order_cnt_lsb lengths of the SPS that virglrenderer writes
++ * (see h264_encode_render_packed_headers()). The virgl protocol doesn't carry the
++ * guest's values; these are ffmpeg's (libavcodec/hw_base_encode_h264.c), so the
++ * slices match an ffmpeg-made SPS too.
++ */
++#define H264_LOG2_MAX_FRAME_NUM_MINUS4 4
++#define H264_LOG2_MAX_POC_LSB_MINUS4   4
++
++/*
+  * Refer to vlVaHandleVAEncSequenceParameterBufferTypeH264() in mesa,
+  * and comment out some unused parameters.
+  */
+@@ -1265,9 +1281,10 @@
+     //seq_fields.bits.mb_adaptive_frame_field_flag
+     //seq_fields.bits.seq_scaling_matrix_present_flag
+     //seq_fields.bits.direct_8x8_inference_flag
+-    //seq_fields.bits.log2_max_frame_num_minus4
++    /* local patch: the values of the packed SPS, see h264_write_sps() */
++    param->seq_fields.bits.log2_max_frame_num_minus4 = H264_LOG2_MAX_FRAME_NUM_MINUS4;
+     ITEM_SET(&param->seq_fields.bits, &desc->seq, pic_order_cnt_type);
+-    //seq_fields.bit.log2_max_pic_order_cnt_lsb_minus4
++    param->seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 = H264_LOG2_MAX_POC_LSB_MINUS4;
+     //seq_fields.bit.delta_pic_order_always_zero_flag
+ 
+     //bit_depth_luma_minus8;
+@@ -1566,6 +1583,466 @@
+     return 0;
+ }
+ 
++/*
++ * Local patch (9999-virgl-video-h264-packed-headers.patch), not upstream.
++ *
++ * Host Mesa >= 24.3 (VA frontend + radeonsi) takes several H.264 slice header
++ * fields only from packed headers sent by the VA client: the NAL header byte,
++ * frame_num, idr_pic_id, pic_order_cnt_lsb, the reference list modifications and
++ * the reference marking. It also writes SPS and PPS into the bitstream only when
++ * it got packed ones. The guest application's packed headers stop in the guest
++ * (the virgl protocol doesn't carry them), so without this every slice has NAL
++ * header 0x00 and frame_num 0, and the stream has no SPS/PPS of its own.
++ *
++ * So virglrenderer writes them from the picture description: SPS and PPS for
++ * each IDR picture, a slice header for every picture. Mesa parses them, writes
++ * its own SPS/PPS into the stream from what it parsed (as it does on bare metal
++ * with the application's headers) and builds the slice headers from them.
++ */
++struct h264_bs {
++    uint8_t buf[256];
++    unsigned bits;
++    bool overflow;
++};
++
++static void h264_bs_u(struct h264_bs *bs, unsigned n, uint32_t v)
++{
++    while (n--) {
++        if (bs->bits >= sizeof(bs->buf) * 8) {
++            bs->overflow = true;
++            return;
++        }
++        if ((v >> n) & 1)
++            bs->buf[bs->bits / 8] |= 0x80 >> (bs->bits % 8);
++        bs->bits++;
++    }
++}
++
++static void h264_bs_ue(struct h264_bs *bs, uint32_t v)
++{
++    uint32_t x;
++    unsigned len = 0;
++
++    if (v > 0xfffffffeu)
++        v = 0xfffffffeu;
++    x = v + 1;
++    while (len < 31 && (x >> (len + 1)))
++        len++;
++    h264_bs_u(bs, len, 0);
++    h264_bs_u(bs, len + 1, x);
++}
++
++static void h264_bs_se(struct h264_bs *bs, int32_t v)
++{
++    h264_bs_ue(bs, v > 0 ? 2 * (uint32_t)v - 1 : 2 * (uint32_t)(-(int64_t)v));
++}
++
++static void h264_bs_trailing_bits(struct h264_bs *bs)
++{
++    h264_bs_u(bs, 1, 1);
++    while (bs->bits % 8)
++        h264_bs_u(bs, 1, 0);
++}
++
++/* 4-byte start code, NAL header byte, RBSP with emulation prevention bytes */
++static unsigned h264_bs_to_nal(const struct h264_bs *bs, uint8_t nal_header,
++                               uint8_t *out, unsigned size)
++{
++    unsigned i, n = 0, zeros = 0, len = (bs->bits + 7) / 8;
++
++    if (bs->overflow || size < 5 + len + len / 2 + 1)
++        return 0;
++
++    out[n++] = 0x00;
++    out[n++] = 0x00;
++    out[n++] = 0x00;
++    out[n++] = 0x01;
++    out[n++] = nal_header;
++    for (i = 0; i < len; i++) {
++        if (zeros >= 2 && bs->buf[i] <= 0x03) {
++            out[n++] = 0x03;
++            zeros = 0;
++        }
++        out[n++] = bs->buf[i];
++        zeros = bs->buf[i] ? 0 : zeros + 1;
++    }
++    return n;
++}
++
++static unsigned h264_profile_idc(enum pipe_video_profile profile)
++{
++    switch (profile) {
++    case PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE:
++    case PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE:
++        return 66;
++    case PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN:
++        return 77;
++    case PIPE_VIDEO_PROFILE_MPEG4_AVC_EXTENDED:
++        return 88;
++    case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH10:
++        return 110;
++    case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH422:
++        return 122;
++    case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH444:
++        return 244;
++    case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH:
++    default:
++        return 100;
++    }
++}
++
++/* H.264 Table A-1: level_idc, MaxMBPS, MaxFS, MaxDpbMbs, MaxBR (1000 bit/s) */
++static const struct {
++    uint8_t idc;
++    uint32_t max_mbps, max_fs, max_dpb_mbs, max_br;
++} h264_levels[] = {
++    { 10,     1485,     99,    396,     64 },
++    { 11,     3000,    396,    900,    192 },
++    { 12,     6000,    396,   2376,    384 },
++    { 13,    11880,    396,   2376,    768 },
++    { 20,    11880,    396,   2376,   2000 },
++    { 21,    19800,    792,   4752,   4000 },
++    { 22,    20250,   1620,   8100,   4000 },
++    { 30,    40500,   1620,   8100,  10000 },
++    { 31,   108000,   3600,  18000,  14000 },
++    { 32,   216000,   5120,  20480,  20000 },
++    { 40,   245760,   8192,  32768,  20000 },
++    { 41,   245760,   8192,  32768,  50000 },
++    { 42,   522240,   8704,  34816,  50000 },
++    { 50,   589824,  22080, 110400, 135000 },
++    { 51,   983040,  36864, 184320, 240000 },
++    { 52,  2073600,  36864, 184320, 240000 },
++    { 60,  4177920, 139264, 696320, 240000 },
++    { 61,  8355840, 139264, 696320, 480000 },
++    { 62, 16711680, 139264, 696320, 800000 },
++};
++
++/*
++ * The guest sends no level (host and guest Mesa 25 leave templat.level at 0 for
++ * encoding) and max_references 16 (PIPE_H264_MAX_REFERENCES), more than any level
++ * allows at 1080p. So: the lowest level that fits frame size, frame rate and
++ * bitrate (as ffmpeg's ff_h264_guess_level does), and as many reference frames
++ * as that level's DPB holds.
++ */
++static void h264_choose_level(const struct virgl_video_codec *codec,
++                              const struct virgl_h264_enc_picture_desc *desc,
++                              unsigned profile_idc,
++                              unsigned *level_idc, unsigned *max_refs)
++{
++    const struct virgl_h264_enc_rate_control *rc = &desc->rate_ctrl[0];
++    uint64_t w = (codec->width + 15) / 16, h = (codec->height + 15) / 16;
++    uint64_t fs = w * h, mbps, br = 0, fps_num = rc->frame_rate_num, fps_den = rc->frame_rate_den;
++    unsigned i, factor = profile_idc >= 100 ? 1250 : 1000;
++
++    if (!fps_num || !fps_den) {
++        fps_num = 30;
++        fps_den = 1;
++    }
++    mbps = (fs * fps_num + fps_den - 1) / fps_den;
++    if (rc->rate_ctrl_method != PIPE_H2645_ENC_RATE_CONTROL_METHOD_DISABLE)
++        br = rc->peak_bitrate > rc->target_bitrate ? rc->peak_bitrate : rc->target_bitrate;
++
++    for (i = 0; i < ARRAY_SIZE(h264_levels) - 1; i++) {
++        if (fs <= h264_levels[i].max_fs && mbps <= h264_levels[i].max_mbps &&
++            w * w <= 8 * h264_levels[i].max_fs && h * h <= 8 * h264_levels[i].max_fs &&
++            br <= (uint64_t)h264_levels[i].max_br * factor)
++            break;
++    }
++    *level_idc = h264_levels[i].idc;
++    *max_refs = fs ? h264_levels[i].max_dpb_mbs / fs : 1;
++    if (*max_refs > 16)
++        *max_refs = 16;
++    if (*max_refs < 1)
++        *max_refs = 1;
++}
++
++/*
++ * Mirrors what host Mesa's parseEncSpsParamsH264() reads and radeonsi supports:
++ * 4:2:0 8-bit, frame MBs only, no scaling lists, VUI with aspect ratio and
++ * timing only (the fields the protocol carries).
++ */
++static void h264_write_sps(struct h264_bs *bs,
++                           const struct virgl_video_codec *codec,
++                           const struct virgl_h264_enc_picture_desc *desc)
++{
++    const struct virgl_h264_enc_seq_param *seq = &desc->seq;
++    unsigned profile_idc = h264_profile_idc(codec->profile);
++    unsigned level_idc, max_refs;
++    bool timing;
++
++    h264_choose_level(codec, desc, profile_idc, &level_idc, &max_refs);
++
++    h264_bs_u(bs, 8, profile_idc);
++    h264_bs_u(bs, 6, seq->enc_constraint_set_flags & 0x3f);
++    h264_bs_u(bs, 2, 0);                     /* reserved_zero_2bits */
++    h264_bs_u(bs, 8, level_idc);
++    h264_bs_ue(bs, 0);                       /* seq_parameter_set_id */
++    if (profile_idc >= 100) {
++        h264_bs_ue(bs, 1);                   /* chroma_format_idc: 4:2:0 */
++        h264_bs_ue(bs, 0);                   /* bit_depth_luma_minus8 */
++        h264_bs_ue(bs, 0);                   /* bit_depth_chroma_minus8 */
++        h264_bs_u(bs, 1, 0);                 /* qpprime_y_zero_transform_bypass_flag */
++        h264_bs_u(bs, 1, 0);                 /* seq_scaling_matrix_present_flag */
++    }
++    h264_bs_ue(bs, H264_LOG2_MAX_FRAME_NUM_MINUS4);
++    h264_bs_ue(bs, seq->pic_order_cnt_type);
++    if (seq->pic_order_cnt_type == 0)
++        h264_bs_ue(bs, H264_LOG2_MAX_POC_LSB_MINUS4);
++    h264_bs_ue(bs, max_refs);                /* max_num_ref_frames */
++    h264_bs_u(bs, 1, 0);                     /* gaps_in_frame_num_value_allowed_flag */
++    h264_bs_ue(bs, (codec->width + 15) / 16 - 1);   /* pic_width_in_mbs_minus1 */
++    h264_bs_ue(bs, (codec->height + 15) / 16 - 1);  /* pic_height_in_map_units_minus1 */
++    h264_bs_u(bs, 1, 1);                     /* frame_mbs_only_flag */
++    h264_bs_u(bs, 1, 1);                     /* direct_8x8_inference_flag */
++    h264_bs_u(bs, 1, seq->enc_frame_cropping_flag ? 1 : 0);
++    if (seq->enc_frame_cropping_flag) {
++        h264_bs_ue(bs, seq->enc_frame_crop_left_offset);
++        h264_bs_ue(bs, seq->enc_frame_crop_right_offset);
++        h264_bs_ue(bs, seq->enc_frame_crop_top_offset);
++        h264_bs_ue(bs, seq->enc_frame_crop_bottom_offset);
++    }
++    h264_bs_u(bs, 1, seq->vui_parameters_present_flag ? 1 : 0);
++    if (seq->vui_parameters_present_flag) {
++        h264_bs_u(bs, 1, seq->vui_flags.aspect_ratio_info_present_flag);
++        if (seq->vui_flags.aspect_ratio_info_present_flag) {
++            h264_bs_u(bs, 8, seq->aspect_ratio_idc);
++            if (seq->aspect_ratio_idc == 255) {  /* Extended_SAR */
++                h264_bs_u(bs, 16, seq->sar_width);
++                h264_bs_u(bs, 16, seq->sar_height);
++            }
++        }
++        h264_bs_u(bs, 1, 0);                 /* overscan_info_present_flag */
++        h264_bs_u(bs, 1, 0);                 /* video_signal_type_present_flag */
++        h264_bs_u(bs, 1, 0);                 /* chroma_loc_info_present_flag */
++        timing = seq->vui_flags.timing_info_present_flag &&
++                 seq->num_units_in_tick && seq->time_scale;
++        h264_bs_u(bs, 1, timing);
++        if (timing) {
++            h264_bs_u(bs, 32, seq->num_units_in_tick);
++            h264_bs_u(bs, 32, seq->time_scale);
++            h264_bs_u(bs, 1, 0);             /* fixed_frame_rate_flag */
++        }
++        h264_bs_u(bs, 1, 0);                 /* nal_hrd_parameters_present_flag */
++        h264_bs_u(bs, 1, 0);                 /* vcl_hrd_parameters_present_flag */
++        h264_bs_u(bs, 1, 0);                 /* pic_struct_present_flag */
++        h264_bs_u(bs, 1, 0);                 /* bitstream_restriction_flag */
++    }
++    h264_bs_trailing_bits(bs);
++}
++
++/* Matches the VA picture parameters filled by h264_fill_enc_picture_param() */
++static void h264_write_pps(struct h264_bs *bs,
++                           const struct virgl_h264_enc_picture_desc *desc)
++{
++    h264_bs_ue(bs, 0);                       /* pic_parameter_set_id */
++    h264_bs_ue(bs, 0);                       /* seq_parameter_set_id */
++    h264_bs_u(bs, 1, desc->pic_ctrl.enc_cabac_enable ? 1 : 0);
++    h264_bs_u(bs, 1, 0);                     /* bottom_field_pic_order_in_frame_present_flag */
++    h264_bs_ue(bs, 0);                       /* num_slice_groups_minus1 */
++    h264_bs_ue(bs, 0);                       /* num_ref_idx_l0_default_active_minus1 */
++    h264_bs_ue(bs, 0);                       /* num_ref_idx_l1_default_active_minus1 */
++    h264_bs_u(bs, 1, 0);                     /* weighted_pred_flag */
++    h264_bs_u(bs, 2, 0);                     /* weighted_bipred_idc */
++    h264_bs_se(bs, 0);                       /* pic_init_qp_minus26 */
++    h264_bs_se(bs, 0);                       /* pic_init_qs_minus26 */
++    h264_bs_se(bs, 0);                       /* chroma_qp_index_offset */
++    h264_bs_u(bs, 1, 0);                     /* deblocking_filter_control_present_flag */
++    h264_bs_u(bs, 1, 0);                     /* constrained_intra_pred_flag */
++    h264_bs_u(bs, 1, 0);                     /* redundant_pic_cnt_present_flag */
++    h264_bs_trailing_bits(bs);
++}
++
++/*
++ * ref_pic_list_modification() for one list. list[] holds the frame_num of each
++ * reference in the encoder's order (from the guest; frame numbers count up from
++ * 0 at each IDR, without wrapping). A P picture with one reference that is the
++ * latest reference picture (frame_num - 1) is the decoder's default list, so no
++ * modification; otherwise the whole list is spelt out.
++ */
++static bool h264_write_ref_list_mod(struct h264_bs *bs, uint32_t curr_frame_num,
++                                    const uint32_t *list, const uint8_t *long_term,
++                                    unsigned num_active_minus1, bool p_slice)
++{
++    int64_t pred = curr_frame_num;
++    unsigned i;
++
++    for (i = 0; i <= num_active_minus1 && i < 32; i++) {
++        if (list[i] == 0xffffffffu || long_term[i] || list[i] >= curr_frame_num) {
++            h264_bs_u(bs, 1, 0);             /* ref_pic_list_modification_flag */
++            return false;
++        }
++    }
++
++    if (p_slice && num_active_minus1 == 0 && list[0] + 1 == curr_frame_num) {
++        h264_bs_u(bs, 1, 0);
++        return true;
++    }
++
++    h264_bs_u(bs, 1, 1);
++    for (i = 0; i <= num_active_minus1 && i < 32; i++) {
++        if (list[i] < pred) {
++            h264_bs_ue(bs, 0);               /* modification_of_pic_nums_idc: subtract */
++            h264_bs_ue(bs, (uint32_t)(pred - list[i] - 1));
++        } else {
++            h264_bs_ue(bs, 1);               /* modification_of_pic_nums_idc: add */
++            h264_bs_ue(bs, (uint32_t)(list[i] - pred - 1));
++        }
++        pred = list[i];
++    }
++    h264_bs_ue(bs, 3);                       /* end of modifications */
++    return true;
++}
++
++/* Returns false if the reference lists couldn't be expressed (logged) */
++static bool h264_write_slice_header(struct h264_bs *bs,
++                                    const struct virgl_h264_enc_picture_desc *desc,
++                                    unsigned nal_ref_idc)
++{
++    bool idr = desc->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_IDR;
++    bool p = desc->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_P;
++    bool b = desc->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_B;
++    uint32_t frame_num = idr ? 0 : desc->frame_num;
++    uint32_t qp;
++    bool override, lists_ok = true;
++
++    h264_bs_ue(bs, 0);                       /* first_mb_in_slice */
++    h264_bs_ue(bs, b ? 6 : p ? 5 : 7);       /* slice_type: all slices B / P / I */
++    h264_bs_ue(bs, 0);                       /* pic_parameter_set_id */
++    h264_bs_u(bs, H264_LOG2_MAX_FRAME_NUM_MINUS4 + 4,
++              frame_num & ((1u << (H264_LOG2_MAX_FRAME_NUM_MINUS4 + 4)) - 1));
++    if (idr)
++        h264_bs_ue(bs, desc->idr_pic_id & 0xffff);
++    if (desc->seq.pic_order_cnt_type == 0)
++        h264_bs_u(bs, H264_LOG2_MAX_POC_LSB_MINUS4 + 4,
++                  desc->pic_order_cnt & ((1u << (H264_LOG2_MAX_POC_LSB_MINUS4 + 4)) - 1));
++    if (b)
++        h264_bs_u(bs, 1, 1);                 /* direct_spatial_mv_pred_flag, as radeonsi */
++    if (p || b) {
++        override = desc->num_ref_idx_l0_active_minus1 != 0 ||
++                   (b && desc->num_ref_idx_l1_active_minus1 != 0);
++        h264_bs_u(bs, 1, override);          /* num_ref_idx_active_override_flag */
++        if (override) {
++            h264_bs_ue(bs, desc->num_ref_idx_l0_active_minus1);
++            if (b)
++                h264_bs_ue(bs, desc->num_ref_idx_l1_active_minus1);
++        }
++        lists_ok = h264_write_ref_list_mod(bs, desc->frame_num, desc->ref_idx_l0_list,
++                                           desc->l0_is_long_term,
++                                           desc->num_ref_idx_l0_active_minus1, p);
++        if (b)
++            lists_ok &= h264_write_ref_list_mod(bs, desc->frame_num, desc->ref_idx_l1_list,
++                                                desc->l1_is_long_term,
++                                                desc->num_ref_idx_l1_active_minus1, false);
++    }
++    if (nal_ref_idc) {
++        if (idr) {
++            h264_bs_u(bs, 1, 0);             /* no_output_of_prior_pics_flag */
++            h264_bs_u(bs, 1, 0);             /* long_term_reference_flag */
++        } else {
++            h264_bs_u(bs, 1, 0);             /* adaptive_ref_pic_marking_mode_flag */
++        }
++    }
++    if (desc->pic_ctrl.enc_cabac_enable && (p || b))
++        h264_bs_ue(bs, desc->pic_ctrl.enc_cabac_init_idc);
++    /* informational: radeonsi's firmware writes the real slice_qp_delta */
++    qp = b ? desc->quant_b_frames : p ? desc->quant_p_frames : desc->quant_i_frames;
++    if (!qp || qp > 51)
++        qp = 26;
++    h264_bs_se(bs, (int32_t)qp - 26);        /* slice_qp_delta (PPS pic_init_qp 26) */
++    h264_bs_trailing_bits(bs);
++    return lists_ok;
++}
++
++static int h264_render_packed_header(struct virgl_video_codec *codec,
++                                     VAEncPackedHeaderType type,
++                                     const uint8_t *data, unsigned size)
++{
++    VAStatus va_stat;
++    VABufferID bufs[2] = { VA_INVALID_ID, VA_INVALID_ID };
++    VAEncPackedHeaderParameterBuffer param;
++
++    memset(&param, 0, sizeof(param));
++    param.type = type;
++    param.bit_length = size * 8;
++    param.has_emulation_bytes = 1;
++
++    va_stat = vaCreateBuffer(va_dpy, codec->va_ctx, VAEncPackedHeaderParameterBufferType,
++                             sizeof(param), 1, &param, &bufs[0]);
++    if (VA_STATUS_SUCCESS == va_stat)
++        va_stat = vaCreateBuffer(va_dpy, codec->va_ctx, VAEncPackedHeaderDataBufferType,
++                                 size, 1, (void *)data, &bufs[1]);
++    if (VA_STATUS_SUCCESS == va_stat)
++        va_stat = vaRenderPicture(va_dpy, codec->va_ctx, bufs, 2);
++
++    /* host Mesa copies the header data (vlVaAddRawHeader) */
++    if (bufs[0] != VA_INVALID_ID)
++        vaDestroyBuffer(va_dpy, bufs[0]);
++    if (bufs[1] != VA_INVALID_ID)
++        vaDestroyBuffer(va_dpy, bufs[1]);
++
++    if (VA_STATUS_SUCCESS != va_stat) {
++        virgl_error("render h264 packed header (type %d) failed, err = 0x%x\n",
++                    (int)type, va_stat);
++        return -1;
++    }
++    return 0;
++}
++
++static void h264_encode_render_packed_headers(
++                            struct virgl_video_codec *codec,
++                            const struct virgl_h264_enc_picture_desc *desc)
++{
++    static bool poc_warned, list_warned;
++    struct h264_bs bs;
++    uint8_t nal[3][5 + 256 * 3 / 2 + 1];
++    unsigned len[3], n = 0, i, nal_ref_idc;
++    VAEncPackedHeaderType type[3];
++    bool idr = desc->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_IDR;
++
++    if (desc->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_SKIP)
++        return;
++    if (desc->seq.pic_order_cnt_type != 0 && desc->seq.pic_order_cnt_type != 2) {
++        if (!poc_warned) {
++            poc_warned = true;
++            virgl_error("H.264 POC type %u not supported, no packed headers\n",
++                        desc->seq.pic_order_cnt_type);
++        }
++        return;
++    }
++
++    nal_ref_idc = idr ? 3 : desc->not_referenced ? 0 : 2;
++
++    if (idr) {
++        memset(&bs, 0, sizeof(bs));
++        h264_write_sps(&bs, codec, desc);
++        len[n] = h264_bs_to_nal(&bs, 0x67, nal[n], sizeof(nal[n]));
++        type[n++] = VAEncPackedHeaderSequence;
++
++        memset(&bs, 0, sizeof(bs));
++        h264_write_pps(&bs, desc);
++        len[n] = h264_bs_to_nal(&bs, 0x68, nal[n], sizeof(nal[n]));
++        type[n++] = VAEncPackedHeaderPicture;
++    }
++
++    memset(&bs, 0, sizeof(bs));
++    if (!h264_write_slice_header(&bs, desc, nal_ref_idc) && !list_warned) {
++        list_warned = true;
++        virgl_error("H.264 reference list with long-term or unknown references, "
++                    "default list used\n");
++    }
++    len[n] = h264_bs_to_nal(&bs, (nal_ref_idc << 5) | (idr ? 5 : 1), nal[n], sizeof(nal[n]));
++    type[n++] = VAEncPackedHeaderSlice;
++
++    for (i = 0; i < n; i++) {
++        if (!len[i]) {
++            virgl_error("H.264 packed header %u too long, none sent\n", i);
++            return;
++        }
++    }
++    for (i = 0; i < n; i++)
++        h264_render_packed_header(codec, type[i], nal[i], len[i]);
++}
++
+ static int h264_encode_bitstream(
+                             struct virgl_video_codec *codec,
+                             struct virgl_video_buffer *source,
+@@ -1577,6 +2054,8 @@
+ 
+     h264_encode_render_picture(codec, source, desc);
+     h264_encode_render_slice(codec, source, desc);
++    /* local patch: after the picture and slice parameters, which Mesa's parser reads */
++    h264_encode_render_packed_headers(codec, desc);
+ 
+     return 0;
+ }
+--- a/src/vrend_video.c	2026-10-16 23:16:35.644245600 +0300
++++ b/src/vrend_video.c	2026-10-16 23:17:10.849401180 +0300
+@@ -146,6 +146,41 @@
+ }
+ 
+ 
++/*
++ * Local patch: EGL image for plane i of a VA surface's dmabuf. Passes the DRM
++ * format modifier when EGL takes one (upstream imports without it, which is
++ * only right for linear surfaces).
++ */
++static EGLImageKHR create_plane_egl_image(const struct virgl_video_dma_buf *dmabuf,
++                                          unsigned i)
++{
++    static int has_modifiers = -1;
++    const struct virgl_video_dma_buf_plane *p = &dmabuf->planes[i];
++    EGLint attrs[20];
++    unsigned k = 0;
++
++    if (has_modifiers < 0)
++        has_modifiers = epoxy_has_egl_extension(eglGetCurrentDisplay(),
++                                    "EGL_EXT_image_dma_buf_import_modifiers");
++
++    attrs[k++] = EGL_LINUX_DRM_FOURCC_EXT;      attrs[k++] = p->drm_format;
++    attrs[k++] = EGL_WIDTH;                     attrs[k++] = dmabuf->width / (i + 1);
++    attrs[k++] = EGL_HEIGHT;                    attrs[k++] = dmabuf->height / (i + 1);
++    attrs[k++] = EGL_DMA_BUF_PLANE0_FD_EXT;     attrs[k++] = p->fd;
++    attrs[k++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT; attrs[k++] = p->offset;
++    attrs[k++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;  attrs[k++] = p->pitch;
++    if (has_modifiers && p->modifier != DRM_FORMAT_MOD_INVALID) {
++        attrs[k++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
++        attrs[k++] = (EGLint)(p->modifier & 0xffffffffu);
++        attrs[k++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
++        attrs[k++] = (EGLint)(p->modifier >> 32);
++    }
++    attrs[k] = EGL_NONE;
++
++    return eglCreateImageKHR(eglGetCurrentDisplay(), EGL_NO_CONTEXT,
++                             EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
++}
++
+ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
+                                        const struct virgl_video_dma_buf *dmabuf)
+ {
+@@ -165,20 +200,8 @@
+         }
+ 
+         /* dmabuf -> eglimage */
+-        if (EGL_NO_IMAGE_KHR == plane->egl_image) {
+-            EGLint img_attrs[16] = {
+-                EGL_LINUX_DRM_FOURCC_EXT,       dmabuf->planes[i].drm_format,
+-                EGL_WIDTH,                      dmabuf->width / (i + 1),
+-                EGL_HEIGHT,                     dmabuf->height / (i + 1),
+-                EGL_DMA_BUF_PLANE0_FD_EXT,      dmabuf->planes[i].fd,
+-                EGL_DMA_BUF_PLANE0_OFFSET_EXT,  dmabuf->planes[i].offset,
+-                EGL_DMA_BUF_PLANE0_PITCH_EXT,   dmabuf->planes[i].pitch,
+-                EGL_NONE
+-            };
+-
+-            plane->egl_image = eglCreateImageKHR(eglGetCurrentDisplay(),
+-                    EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
+-        }
++        if (EGL_NO_IMAGE_KHR == plane->egl_image)
++            plane->egl_image = create_plane_egl_image(dmabuf, i);
+ 
+         if (EGL_NO_IMAGE_KHR == plane->egl_image) {
+             virgl_error("%s: create egl image failed\n", __func__);
+@@ -226,20 +249,8 @@
+         }
+ 
+         /* dmabuf -> eglimage */
+-        if (EGL_NO_IMAGE_KHR == plane->egl_image) {
+-            EGLint img_attrs[16] = {
+-                EGL_LINUX_DRM_FOURCC_EXT,       dmabuf->planes[i].drm_format,
+-                EGL_WIDTH,                      dmabuf->width / (i + 1),
+-                EGL_HEIGHT,                     dmabuf->height / (i + 1),
+-                EGL_DMA_BUF_PLANE0_FD_EXT,      dmabuf->planes[i].fd,
+-                EGL_DMA_BUF_PLANE0_OFFSET_EXT,  dmabuf->planes[i].offset,
+-                EGL_DMA_BUF_PLANE0_PITCH_EXT,   dmabuf->planes[i].pitch,
+-                EGL_NONE
+-            };
+-
+-            plane->egl_image = eglCreateImageKHR(eglGetCurrentDisplay(),
+-                    EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
+-        }
++        if (EGL_NO_IMAGE_KHR == plane->egl_image)
++            plane->egl_image = create_plane_egl_image(dmabuf, i);
+ 
+         if (EGL_NO_IMAGE_KHR == plane->egl_image) {
+             virgl_error("%s: create egl image failed\n", __func__);
+@@ -263,6 +274,9 @@
+ 
+     }
+ 
++    /* local patch: the VA encoder reads the dmabuf without any GL synchronisation */
++    glFinish();
++
+     glBindTexture(GL_TEXTURE_2D, 0);
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+ 

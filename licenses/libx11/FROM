@@ -1,0 +1,5 @@
+origin=libx11
+aports=main/libx11 at 2715415e33c4d23ee945e9f0f5d8d93b36b0fe01 (3.22-stable)
+version=1.8.11-r0
+collected=2026-10-27 by bin/collect-licenses
+file=COPYING from libX11-1.8.11.tar.xz:libX11-1.8.11/COPYING sha512=4e2191258039ad0ea7fe5d22b8b0ab5e1d101b20fa4cd0fb44c5e1ac8b2ffbb3a0ad80ac3a67a3803ca30b972476b739a0c244b2ac8b7de6a32b06dc4e2c674b

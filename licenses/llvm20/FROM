@@ -1,0 +1,5 @@
+origin=llvm20
+aports=main/llvm20 at 2715415e33c4d23ee945e9f0f5d8d93b36b0fe01 (3.22-stable)
+version=20.1.8-r0
+collected=2026-10-27 by bin/collect-licenses
+file=llvm/LICENSE.TXT from llvm-project-20.1.8.src.tar.xz:llvm-project-20.1.8.src/llvm/LICENSE.TXT sha512=f330e72e6a1da468569049437cc0ba7a41abb816ccece7367189344f7ebfef730f4788ac7af2bef0aa8a49341c15ab1d31e941ffa782f264d11fe0dc05470773

@@ -1,0 +1,44 @@
+Description: virtio-gpu-virgl: enable virglrenderer's VA-API video module
+ Passes VIRGL_RENDERER_USE_VIDEO and a get_drm_fd callback (first render
+ node), so guests get hardware video decode/encode through the host's
+ Mesa VA-API driver. All changes sit next to the include block and inside
+ virtio_gpu_virgl_init(), whose context is identical in QEMU 10.0 to 11.1,
+ so the patch applies without fuzz across those versions. Defines
+ VIRGL_RENDERER_UNSTABLE_APIS itself, so it builds against a virglrenderer
+ with or without -Dunstable-apis=true.
+Origin: rework of a 2025 QEMU 10 patch the user used, and pve-qemu-hw-accel's
+ 9999-nineball-pve-qemu-kvm-11.1.1-2.patch
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -21,6 +21,21 @@
+ #include "hw/virtio/virtio-gpu-pixman.h"
+ 
+ #include "ui/egl-helpers.h"
++#include "qemu/drm.h"
++
++/*
++ * Video through the host's VA-API (virglrenderer's video module).
++ * VIRGL_RENDERER_USE_VIDEO is an unstable API. Define the macro here so
++ * this builds whether or not virglrenderer.pc carries it.
++ */
++#ifndef VIRGL_RENDERER_UNSTABLE_APIS
++#define VIRGL_RENDERER_UNSTABLE_APIS 1
++#endif
++
++static int virgl_get_drm_fd(void *opaque)
++{
++    return qemu_drm_rendernode_open(NULL);
++}
+ 
+ #include <virglrenderer.h>
+ 
+@@ -1437,6 +1452,9 @@
+     uint32_t flags = 0;
+     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+ 
++    virtio_gpu_3d_cbs.get_drm_fd = virgl_get_drm_fd;
++    flags |= VIRGL_RENDERER_USE_VIDEO;
++
+ #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
+     if (qemu_egl_display) {
+         virtio_gpu_3d_cbs.version = 4;

@@ -1,0 +1,5 @@
+origin=libva
+aports=main/libva at 2715415e33c4d23ee945e9f0f5d8d93b36b0fe01 (3.22-stable)
+version=2.22.0-r1
+collected=2026-10-27 by bin/collect-licenses
+file=COPYING from libva-2.22.0.tar.gz:libva-2.22.0/COPYING sha512=cd633e5e09eac1ed10f1fc12b0f664f836e0eda9e47c17e1295b746cfd643a18fd0564a06a148ced3cf1e2321aa4d21275918bcf8c717d3981e98a598179f370

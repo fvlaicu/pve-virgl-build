@@ -1,0 +1,14 @@
+Explanation: pve-virgl builds win; 990 < 1000, so apt never downgrades through this pin
+Package: pve-qemu-kvm libvirglrenderer1 virgl-server
+Pin: release o=pve-virgl
+Pin-Priority: 990
+
+Explanation: stock only where nothing is installed, so a missing local index can't swap it back in
+Package: pve-qemu-kvm
+Pin: release o=Proxmox
+Pin-Priority: 50
+
+Explanation: stock only where nothing is installed, so a missing local index can't swap it back in
+Package: libvirglrenderer1 virgl-server
+Pin: release o=Debian
+Pin-Priority: 50

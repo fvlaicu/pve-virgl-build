@@ -1,0 +1,3 @@
+// pve-virgl: after each apt update, say when Proxmox or Debian has a newer base than the
+// virgl build the pin keeps installed (/usr/local/sbin/pve-virgl-check). Never fails apt.
+APT::Update::Post-Invoke-Success { "[ ! -x /usr/local/sbin/pve-virgl-check ] || /usr/local/sbin/pve-virgl-check || true"; };

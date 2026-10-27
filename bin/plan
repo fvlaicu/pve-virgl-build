@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# The plan job (plan, "The workflow"): checks upstream, then decides what to build and with which
+# build number. Read-only: changes nothing in the state, publishes nothing.
+#   plan                      what the hourly run does
+#   plan --dry-run            the same decisions, marked dry: nothing is built afterwards
+#   plan --force <product>    build <product> even if its inputs haven't changed, and without waiting
+#                             after a failure (qemu, virglrenderer, mesa, bundle; repeatable)
+# In GitHub Actions the options come from VIRGL_FORCE ("qemu mesa") and VIRGL_DRY (1).
+# Output: $PLAN/decisions (key=value, read by build-one, publish and site) and $PLAN/upstream; in
+# Actions also the job outputs qemu, virglrenderer, mesa, bundle (1 = build), any, dry, run.
+# A failed build is retried after 1 h, 2 h, 4 h ... up to once a day while its inputs stay the same.
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+declare -A FORCE=()
+DRY=${VIRGL_DRY:-0}
+[[ $DRY == 1 || $DRY == true ]] && DRY=1 || DRY=0
+for p in ${VIRGL_FORCE:-}; do
+    [[ $p =~ ^(qemu|virglrenderer|mesa|bundle)$ ]] || die "VIRGL_FORCE: $p isn't qemu, virglrenderer, mesa or bundle"
+    FORCE[$p]=1
+done
+while (( $# )); do
+    case $1 in
+        --dry-run) DRY=1; shift ;;
+        --force)
+            [[ ${2:-} =~ ^(qemu|virglrenderer|mesa|bundle)$ ]] || die "--force takes qemu, virglrenderer, mesa or bundle"
+            FORCE[$2]=1; shift 2 ;;
+        *) die "usage: plan [--dry-run] [--force <product>]..." ;;
+    esac
+done
+
+mkdir -p "$STATE" "$PLAN" "$KEYRINGS"
+RUN=$(date -u +%Y%m%dT%H%M%SZ)
+log "run $RUN"
+"$INFRA/bin/check-upstream" >/dev/null || log "check-upstream failed"
+cp "$STATE/upstream" "$PLAN/upstream"
+
+wanted() { # product [Mesa version, for the bundle] → 0 if it should be built now; says why not
+    local p=$1 t pub fails at wait
+    t=$(tuple_of "$p" "${2:-}")
+    if [[ -z $t ]]; then log "[$p] skipped: $(why_unknown "$p")"; return 1; fi
+    if [[ -n ${FORCE[$p]:-} ]]; then log "[$p] forced: $t"; return 0; fi
+    pub=$(kv_get "$STATE/$p.published" tuple)
+    [[ $t != "$pub" ]] || return 1
+    if [[ -f $STATE/$p.rejected ]] && grep -qxF "$t" "$STATE/$p.rejected"; then
+        log "[$p] not rebuilt: these inputs were rejected by rollback ($t)"
+        return 1
+    fi
+    if [[ $(kv_get "$STATE/$p.last" tuple) == "$t" && $(kv_get "$STATE/$p.last" result) == failed ]]; then
+        fails=$(kv_get "$STATE/$p.last" fails) at=$(kv_get "$STATE/$p.last" at)
+        fails=${fails:-1} at=${at:-0}
+        wait=$(( 3600 << (fails > 6 ? 5 : fails - 1) ))
+        (( wait <= 86400 )) || wait=86400
+        if (( $(date +%s) < at + wait )); then
+            log "[$p] failed ${fails}x with these inputs; next try after $(date -u -d "@$((at + wait))" +%FT%TZ)"
+            return 1
+        fi
+    fi
+    log "[$p] inputs changed: $t"
+}
+
+D=("run=$RUN" "dry=$DRY")
+declare -A B=([qemu]=0 [virglrenderer]=0 [mesa]=0 [bundle]=0) DV=()
+decide() { # product base tuple → the build number and version, into D and DV
+    local p=$1 base=$2 n v
+    n=$(( $(n_used "$p" "$base") + 1 ))
+    v=$(version_for "$p" "$base" "$n")
+    B[$p]=1 DV[$p]=$v
+    D+=("${p}=1" "${p}_base=$base" "${p}_n=$n" "${p}_version=$v" "${p}_tuple=$3")
+    log "[$p] → $v"
+}
+
+for p in qemu virglrenderer; do
+    if wanted "$p"; then decide "$p" "$(kv_get "$STATE/upstream" "${p}_base")" "$(tuple_of "$p")"; fi
+done
+# Mesa first: a new Mesa build changes the bundle's inputs, so the same run builds the bundle from
+# it (and doesn't, if the Mesa build fails). Otherwise the bundle builds from the published Mesa.
+if wanted mesa; then
+    alp=$(kv_get "$STATE/upstream" mesa_alpine)
+    decide mesa "${alp%-r*}" "$(tuple_of mesa)"
+    mesa=${DV[mesa]}
+    if wanted bundle "$mesa"; then
+        decide bundle "$(bundle_prefix "$alp")" "$(tuple_of bundle "$mesa")"
+        D+=("bundle_mesa=$mesa" "bundle_alpine=$alp")
+    fi
+elif wanted bundle; then
+    mesa=$(kv_get "$STATE/mesa.published" version)
+    alp=$(kv_get "$STATE/mesa.published" alpine)
+    if [[ -z $alp ]]; then
+        log "[bundle] skipped: mesa.published has no alpine= (Alpine's mesa version)"
+    else
+        decide bundle "$(bundle_prefix "$alp")" "$(tuple_of bundle "$mesa")"
+        D+=("bundle_mesa=$mesa" "bundle_alpine=$alp")
+    fi
+fi
+
+any=0
+for p in "${PRODUCTS[@]}"; do
+    (( B[$p] == 0 )) || any=1
+    (( B[$p] == 1 )) || D+=("$p=0")
+done
+if (( DRY )); then
+    log "dry run: nothing is built or published"
+    any=0
+    for p in "${PRODUCTS[@]}"; do B[$p]=0; done   # the job outputs: no build job runs
+fi
+D+=("any=$any")
+kv_write "$PLAN/decisions" "${D[@]}"
+gh_output "run=$RUN" "dry=$DRY" "any=$any" "qemu=${B[qemu]}" "virglrenderer=${B[virglrenderer]}" "mesa=${B[mesa]}" "bundle=${B[bundle]}"
+{
+    echo "### virgl builds: plan for run $RUN$( (( DRY )) && echo ' (dry run)' || true)"
+    echo
+    echo "| Product | Upstream | Published | This run |"
+    echo "|---|---|---|---|"
+    for p in "${PRODUCTS[@]}"; do
+        case $p in
+            qemu|virglrenderer) up=$(kv_get "$STATE/upstream" "${p}_base") ;;
+            mesa) up=$(kv_get "$STATE/upstream" mesa_alpine) ;;
+            bundle) up="libs $(kv_get "$STATE/upstream" bundle_libs)" ;;
+        esac
+        v=$(kv_get "$PLAN/decisions" "${p}_version")
+        printf '| %s | %s | %s | %s |\n' "$p" "${up:--}" "$(kv_get "$STATE/$p.published" version)" "${v:+build $v}"
+    done
+} | gh_summary
+cat "$PLAN/decisions"

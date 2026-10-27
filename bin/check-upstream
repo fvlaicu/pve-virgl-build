@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Upstream facts for the input tuples, written to $STATE/upstream (key=value; not tracked). Each
+# source is checked on its own. One that fails leaves its key out and sets <product>_error, and
+# virgl-build skips that product this run. Changes nothing but the state files.
+#   qemu_base             newest pve-qemu-kvm in Proxmox's $TRACK_SUITE (signed apt index)
+#   virglrenderer_base    newest virglrenderer source in trixie, trixie-updates, trixie-security
+#   mesa_alpine           mesa in Alpine's v$ALPINE_BRANCH index (apk checks the signature), once
+#                         the aports recipe on $ALPINE_BRANCH-stable has the same version
+#   bundle_libs           one hash over the index versions of the Alpine packages that own a file
+#                         in the published bundle (state's bundle.MANIFEST): changes when one of them
+#                         is updated
+#   virglrenderer_tag, mesa_tag    newest upstream releases, shown on the status page only
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+mkdir -p "$STATE" "$KEYRINGS"
+declare -A F=()
+err() { F[${1}_error]=$2; log "[$1] upstream check: $2"; }
+
+apt_update() { # tree → refreshes its lists; any failed or unsigned index is an error
+    apt_tree "$1" apt-get -q update --error-on=any > "$STATE/apt/$1/update.log" 2>&1
+}
+
+check_qemu() {
+    local v
+    ensure_proxmox_keyring || { err qemu "no verified Proxmox keyring"; return 0; }
+    apt_tree_init proxmox "deb [arch=amd64 signed-by=$KEYRINGS/proxmox-archive-keyring.gpg] http://download.proxmox.com/debian/pve $DIST $TRACK_SUITE"
+    apt_update proxmox || { err qemu "apt update of Proxmox $TRACK_SUITE failed: $(tail -n 1 "$STATE/apt/proxmox/update.log")"; return 0; }
+    v=$(apt_tree proxmox apt-cache show pve-qemu-kvm 2>/dev/null | sed -n 's/^Version: //p' | ver_max) || true
+    if [[ -n $v ]]; then F[qemu_base]=$v; else err qemu "no pve-qemu-kvm in Proxmox $TRACK_SUITE"; fi
+}
+
+check_virglrenderer() {
+    local k=$DEBIAN_KEYRING v
+    ensure_debian_keyring || { err virglrenderer "no Debian archive keyring"; return 0; }
+    apt_tree_init debian-src "deb-src [signed-by=$k] http://deb.debian.org/debian $DIST main
+deb-src [signed-by=$k] http://deb.debian.org/debian $DIST-updates main
+deb-src [signed-by=$k] http://deb.debian.org/debian-security $DIST-security main"
+    apt_update debian-src || { err virglrenderer "apt update of Debian $DIST sources failed: $(tail -n 1 "$STATE/apt/debian-src/update.log")"; return 0; }
+    v=$(apt_tree debian-src apt-cache showsrc virglrenderer 2>/dev/null | sed -n 's/^Version: //p' | ver_max) || true
+    if [[ -n $v ]]; then F[virglrenderer_base]=$v; else err virglrenderer "no virglrenderer source in $DIST"; fi
+}
+
+check_alpine() {
+    local manifest=$STATE/bundle.MANIFEST out pkgs idx recipe rv n v
+    local -a names=()
+    # the Alpine packages behind the published bundle, apart from our own Mesa packages
+    if [[ -f $manifest ]]; then
+        mapfile -t names < <(awk '$1 == "owner" && $4 == "index" { print $2 }' "$manifest")
+    fi
+    # upgrade first: a package the image ships older would otherwise be listed twice (installed and upgradable)
+    if ! out=$(podman run --rm "$IMAGE_ALPINE" sh -c 'apk update -q >/dev/null && apk upgrade -q >/dev/null && apk list "$@"' sh mesa "${names[@]}" 2>&1); then
+        err mesa "apk in $IMAGE_ALPINE failed: $(tail -n 1 <<<"$out")"
+        err bundle "apk in $IMAGE_ALPINE failed"
+        return 0
+    fi
+    # "mesa-25.1.9-r0 x86_64 {mesa} (MIT ...)" → "mesa 25.1.9-r0"
+    pkgs=$(awk '{ if (match($1, /-[0-9][^-]*-r[0-9]+$/)) print substr($1, 1, RSTART - 1), substr($1, RSTART + 1) }' <<<"$out")
+    dups=$(awk '{ print $1 }' <<<"$pkgs" | sort | uniq -d | paste -sd' ')
+    if [[ -n $dups ]]; then
+        err mesa "apk list gave two versions of: $dups"
+        err bundle "apk list gave two versions of: $dups"
+        return 0
+    fi
+    idx=$(awk '$1 == "mesa" { print $2 }' <<<"$pkgs")
+    if [[ -z $idx ]]; then
+        err mesa "no mesa in Alpine v$ALPINE_BRANCH's index"
+    else
+        # The build takes the recipe from aports; right after an update aports can be ahead of the
+        # index for a while. Wait until they agree rather than build something that isn't released.
+        recipe=$(curl -fsS --max-time 30 "$MESA_RECIPE_URL" || true)
+        rv="$(sed -n 's/^pkgver=//p' <<<"$recipe")-r$(sed -n 's/^pkgrel=//p' <<<"$recipe")"
+        if [[ -z $recipe ]]; then err mesa "could not fetch the aports recipe"
+        elif [[ $rv != "$idx" ]]; then err mesa "aports recipe is $rv, the index has $idx: waiting until they agree"
+        else F[mesa_alpine]=$idx
+        fi
+    fi
+    if (( ${#names[@]} )); then
+        F[bundle_libs]=$(for n in "${names[@]}"; do
+            v=$(awk -v n="$n" '$1 == n { print $2 }' <<<"$pkgs")
+            echo "$n ${v:-missing}"
+        done | libs_hash)
+    fi
+}
+
+newest_tag() { # git URL, tag regex → the highest matching tag, empty if none or unreachable
+    { git ls-remote --tags --refs "$1" 2>/dev/null || true; } | sed -n 's#.*refs/tags/##p' |
+        { grep -E "$2" || true; } | sort -V | tail -n 1
+}
+
+check_qemu
+check_virglrenderer
+check_alpine
+F[virglrenderer_tag]=$(newest_tag https://gitlab.freedesktop.org/virgl/virglrenderer.git '^[0-9]+\.[0-9]+\.[0-9]+$')
+F[mesa_tag]=$(newest_tag https://gitlab.freedesktop.org/mesa/mesa.git '^mesa-[0-9]+\.[0-9]+\.[0-9]+$')
+F[checked]=$(date -u +%FT%TZ)
+
+lines=()
+for k in "${!F[@]}"; do lines+=("$k=${F[$k]}"); done
+mapfile -t lines < <(printf '%s\n' "${lines[@]}" | sort)
+kv_write "$STATE/upstream" "${lines[@]}"
+printf '%s\n' "${lines[@]}"

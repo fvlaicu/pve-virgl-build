@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Collects the upstream license texts of the bundle's libraries into licenses/<origin>/, which the
+# bundle build copies into vaapi/licenses/ (docs/DESIGN.md, "Licenses"). Run by hand, once per
+# library: when bin/verify says a bundle library has no license texts, or to refresh one. Takes the
+# origin's recipe from aports $ALPINE_BRANCH-stable, downloads its upstream files from Alpine's
+# distfiles mirror into a temporary directory, and checks them against the APKBUILD's sha512sums.
+#   collect-licenses list <origin>...         the license-like files in each upstream file (a suggestion)
+#   collect-licenses get <origin> <path>...   replaces licenses/<origin>/ with those files (paths as list
+#                                             shows them) and FROM, which says where they came from.
+#                                             <path>:<from>-<to> takes those lines only, as <file>.notice:
+#                                             for a source without a license file, whose notices are in
+#                                             its files' headers (libdrm)
+# Writes nothing but licenses/<origin>/.
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+usage() { die "usage: collect-licenses list <origin>... | get <origin> <path>..."; }
+(( $# >= 2 )) || usage
+mode=$1
+shift
+[[ $mode == list || $mode == get ]] || usage
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+git init -q --bare "$tmp/aports.git"
+git -C "$tmp/aports.git" fetch -q --depth 1 "$APORTS_URL" "$ALPINE_BRANCH-stable"
+commit=$(git -C "$tmp/aports.git" rev-parse FETCH_HEAD)
+
+upstream() { # origin → its upstream files, downloaded into $tmp/d and checked: "<file> <sha512>" lines; sets dir
+    local o=$1 r sum f
+    local -a here
+    dir=
+    for r in main community; do
+        if git -C "$tmp/aports.git" cat-file -e "$commit:$r/$o/APKBUILD" 2>/dev/null; then dir=$r/$o; fi
+    done
+    [[ -n $dir ]] || die "$o: no main/$o or community/$o in aports $ALPINE_BRANCH-stable"
+    mapfile -t here < <(git -C "$tmp/aports.git" ls-tree --name-only "$commit" "$dir/" | sed 's|.*/||')
+    mkdir -p "$tmp/d"
+    while read -r sum f; do
+        [[ $f != */* && $f != .* ]] || die "$o: odd file name '$f' in sha512sums"
+        if printf '%s\n' "${here[@]}" | grep -xF -- "$f" >/dev/null; then continue; fi   # aports' own file
+        [[ -f $tmp/d/$f ]] || curl -fsSL --retry 3 -o "$tmp/d/$f" "$ALPINE_DISTFILES/$f" || die "$o: can't download $ALPINE_DISTFILES/$f"
+        [[ $(sha512sum < "$tmp/d/$f" | cut -d' ' -f1) == "$sum" ]] || die "$o: $f doesn't match the APKBUILD's sha512sums"
+        echo "$f $sum"
+    done < <(git -C "$tmp/aports.git" show "$commit:$dir/APKBUILD" |
+        awk '/^sha512sums="/ { on = 1; sub(/^sha512sums="/, "") }
+             on { last = sub(/".*$/, ""); if (NF == 2) print $1, $2; if (last) exit }')
+}
+members() { tar -tf "$tmp/d/$1" 2>/dev/null; }   # an upstream file's entries; nothing if it isn't an archive
+
+if [[ $mode == list ]]; then
+    for o in "$@"; do
+        upstream "$o" > "$tmp/files"
+        echo "== $o ($dir at aports ${commit:0:12})"
+        while read -r f _; do
+            echo "  $f"
+            # Entries at most two levels below the top directory, named like a license file.
+            members "$f" | awk -F/ '$NF != "" && NF <= 3 && toupper($NF) ~ /^(COPYING|COPYRIGHT|LICEN[CS]E|NOTICE|UNLICENSE)/ { print "    " $0 }'
+        done < "$tmp/files"
+    done
+    exit 0
+fi
+
+o=$1
+shift
+(( $# )) || usage
+upstream "$o" > "$tmp/files"
+out=$INFRA/licenses/$o
+rm -rf "$tmp/out"
+mkdir -p "$tmp/out"
+{
+    echo "origin=$o"
+    echo "aports=$dir at $commit ($ALPINE_BRANCH-stable)"
+    echo "version=$(git -C "$tmp/aports.git" show "$commit:$dir/APKBUILD" | sed -n 's/^pkgver=//p')-r$(git -C "$tmp/aports.git" show "$commit:$dir/APKBUILD" | sed -n 's/^pkgrel=//p')"
+    echo "collected=$(date -u +%F) by bin/collect-licenses"
+} > "$tmp/out/FROM"
+for arg; do
+    p=$arg lines=
+    if [[ $arg =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then p=${BASH_REMATCH[1]} lines=${BASH_REMATCH[2]},${BASH_REMATCH[3]}; fi
+    [[ $p != /* && ! $p =~ (^|/)\.\.(/|$) ]] || die "$o: odd path $p"
+    src=
+    while read -r f sum; do
+        if members "$f" | grep -xF -- "$p" >/dev/null; then src=$f; break; fi   # not -q: tar would get SIGPIPE
+    done < "$tmp/files"
+    [[ -n $src ]] || die "$o: no $p in its upstream files"
+    rel=${p#*/}    # below the archive's top directory
+    mkdir -p "$tmp/out/$(dirname "$rel")"
+    if [[ -n $lines ]]; then
+        tar -xOf "$tmp/d/$src" "$p" | sed -n "${lines}p" > "$tmp/out/$rel.notice"
+        rel=$rel.notice
+    else
+        tar -xOf "$tmp/d/$src" "$p" > "$tmp/out/$rel"
+    fi
+    [[ -s $tmp/out/$rel ]] || die "$o: $arg is empty or not a regular file"
+    echo "file=$rel from $src:${p}${lines:+ lines ${lines/,/-}} sha512=$sum" >> "$tmp/out/FROM"
+done
+rm -rf "$out"
+mkdir -p "$INFRA/licenses"
+cp -R "$tmp/out" "$out"
+echo "licenses/$o:"
+(cd "$out" && find . -type f | sort | sed 's|^\./|  |')

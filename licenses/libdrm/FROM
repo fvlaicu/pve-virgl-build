@@ -1,0 +1,7 @@
+origin=libdrm
+aports=main/libdrm at 2715415e33c4d23ee945e9f0f5d8d93b36b0fe01 (3.22-stable)
+version=2.4.124-r0
+collected=2026-10-27 by bin/collect-licenses
+file=xf86drm.c.notice from drm-libdrm-2.4.124.tar.gz:drm-libdrm-2.4.124/xf86drm.c lines 9-32 sha512=448178e7ac3f9228fc9defeeafe3cf03e0d0651372660392879795067c86e937a02c5375b805b0c7daa6825a496a36ce65871457ee8d87635c8c26d2ebaae65d
+file=amdgpu/amdgpu_device.c.notice from drm-libdrm-2.4.124.tar.gz:drm-libdrm-2.4.124/amdgpu/amdgpu_device.c lines 1-22 sha512=448178e7ac3f9228fc9defeeafe3cf03e0d0651372660392879795067c86e937a02c5375b805b0c7daa6825a496a36ce65871457ee8d87635c8c26d2ebaae65d
+file=intel/intel_bufmgr.c.notice from drm-libdrm-2.4.124.tar.gz:drm-libdrm-2.4.124/intel/intel_bufmgr.c lines 1-26 sha512=448178e7ac3f9228fc9defeeafe3cf03e0d0651372660392879795067c86e937a02c5375b805b0c7daa6825a496a36ce65871457ee8d87635c8c26d2ebaae65d

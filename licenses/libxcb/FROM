@@ -1,0 +1,5 @@
+origin=libxcb
+aports=main/libxcb at 2715415e33c4d23ee945e9f0f5d8d93b36b0fe01 (3.22-stable)
+version=1.17.0-r0
+collected=2026-10-27 by bin/collect-licenses
+file=COPYING from libxcb-1.17.0.tar.xz:libxcb-1.17.0/COPYING sha512=945b1f28e8b407a4d0ebf88c99ef3cbef763fd75e6eaa8e971946e44ce8dbe9b478c56ae85aaaadab7fdb25987e88570d9d4fb9ad2febd6d6bf21d644a0e10d0

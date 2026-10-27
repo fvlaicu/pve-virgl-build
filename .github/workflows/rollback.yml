@@ -1,0 +1,100 @@
+# Takes a published build back (bin/rollback), then redeploys the site. The run's summary says what
+# to do on the nodes or in the Plex VM.
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: 'What to roll back'
+        type: choice
+        options: [qemu, virglrenderer, bundle]
+      version:
+        description: 'The published version (debs) or bundle name to take back'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: virgl-build
+  cancel-in-progress: false
+
+env:
+  VIRGL_STATE: ${{ github.workspace }}/_run/state
+
+jobs:
+  # The upstream facts for the status page, as in a dry run; nothing is built.
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: state
+          path: _run/state
+          persist-credentials: false
+      - env:
+          VIRGL_DRY: '1'
+        run: bin/plan
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan
+          path: _run/plan/
+          retention-days: 1
+
+  rollback:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: publish
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: state
+          path: _run/state
+      - name: Tools
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends aptly
+      - name: Signing key
+        env:
+          VIRGL_SIGNING_KEY: ${{ secrets.VIRGL_SIGNING_KEY }}
+        run: |
+          GNUPGHOME=$(mktemp -d)
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          printf '%s\n' "$VIRGL_SIGNING_KEY" | GNUPGHOME=$GNUPGHOME gpg --batch --import
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCT: ${{ inputs.product }}
+          VERSION: ${{ inputs.version }}
+        run: bin/rollback "$PRODUCT" "$VERSION"
+      - name: Commit the state
+        env:
+          PRODUCT: ${{ inputs.product }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          bin/state-commit "rollback: $PRODUCT $VERSION"
+      - name: Forget the key
+        if: always()
+        run: |
+          gpgconf --kill gpg-agent || true
+          rm -rf "$GNUPGHOME"
+
+  site:
+    needs: [plan, rollback]
+    uses: ./.github/workflows/site.yml
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    with:
+      deploy: true
+      publish-result: ${{ needs.rollback.result }}

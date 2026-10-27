@@ -1,0 +1,46 @@
+#!/bin/bash
+# The node-side apt check (docs/DESIGN.md, "Status"), run by 99pve-virgl-check after each
+# apt update. The pin keeps our virgl build installed even when Proxmox or Debian has a newer one;
+# this says so, with both versions, until our rebuild of it is published. Silent when all is well.
+# Also warns about a pinned package that isn't a virgl build at all, and when the builds have
+# stopped running (status.json older than STALE_DAYS: GitHub disables the hourly schedule of a
+# public repo after 60 days without activity). Never fails apt.
+set -u
+export LC_ALL=C
+STALE_DAYS=3   # build.conf's STALE_DAYS (make lint checks that they agree)
+# Our repo is whatever the installed .sources names; every other source counts as stock.
+ours=$(sed -n 's/^URIs: *//p' /etc/apt/sources.list.d/pve-virgl.sources 2>/dev/null | head -n 1)
+[[ -n $ours ]] || exit 0
+status=${ours%/apt/*}/files/status/
+
+newest() { # stdin: versions → the highest by dpkg's rules
+    local best='' v
+    while read -r v; do
+        [[ -n $v ]] || continue
+        if [[ -z $best ]] || dpkg --compare-versions "$v" gt "$best"; then best=$v; fi
+    done
+    echo "$best"
+}
+
+for pkg in pve-qemu-kvm libvirglrenderer1 virgl-server; do
+    st=$(dpkg-query -W -f='${db:Status-Status} ${Version}' "$pkg" 2>/dev/null) || continue
+    [[ $st == "installed "* ]] || continue
+    inst=${st#installed }
+    # "pve-qemu-kvm | 11.0.3-4 | http://download.proxmox.com/debian/pve trixie/... Packages"
+    stock=$(apt-cache madison "$pkg" 2>/dev/null | awk -F' *[|] *' -v o="$ours " 'index($3, o) != 1 { print $2 }' | newest)
+    if [[ ! $inst =~ virgl[0-9]+$ ]]; then
+        echo "pve-virgl: $pkg $inst is not a virgl build, so no hardware video. node/opt-in.sh installs ours."
+        continue
+    fi
+    # base of "11.0.3-4virgl2", and of the hand builds' "1.1.0-2+virgl5"
+    base=$(sed -E 's/\+?virgl[0-9]+$//' <<<"$inst")
+    if [[ -n $stock ]] && dpkg --compare-versions "$stock" gt "$base"; then
+        echo "pve-virgl: $pkg $stock is out, but this node keeps $inst (built on $base) until our rebuild is published. Status: $status"
+    fi
+done
+# The builds' heartbeat. A failed fetch says nothing: apt update already reported the network.
+gen=$(curl -fsSL --max-time 5 "${status}status.json" 2>/dev/null | sed -n 's/^ *"generated": *\([0-9]*\),*$/\1/p')
+if [[ $gen =~ ^[0-9]+$ ]] && (( $(date +%s) - gen > STALE_DAYS * 86400 )); then
+    echo "pve-virgl: the builds haven't run since $(date -u -d "@$gen" '+%F %H:%M') UTC. Check the repo's Actions tab: GitHub stops a public repo's schedule after 60 days without activity (gh workflow enable virgl-build.yml)."
+fi
+exit 0

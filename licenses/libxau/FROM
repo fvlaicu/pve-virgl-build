@@ -1,0 +1,5 @@
+origin=libxau
+aports=main/libxau at 2715415e33c4d23ee945e9f0f5d8d93b36b0fe01 (3.22-stable)
+version=1.0.12-r0
+collected=2026-10-27 by bin/collect-licenses
+file=COPYING from libXau-1.0.12.tar.xz:libXau-1.0.12/COPYING sha512=4bbe8796f4a14340499d5f75046955905531ea2948944dfc3d6069f8b86c1710042bfc7918d459320557883e6631359d48e6173c69c62ff572314e864ff97c5e

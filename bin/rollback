@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# The rollback job (rollback.yml): takes a published build back, and marks its input tuple rejected
+# so the next runs don't build the same thing again; a change to any input builds anew. Needs the
+# key ($GNUPGHOME): it re-signs the apt indexes or current.asc. Its Release stays, retitled
+# "(rolled back)". The site job deploys the result.
+#   rollback qemu <version>            e.g. 11.0.3-4virgl3: its packages leave the apt repo
+#   rollback virglrenderer <version>
+#   rollback bundle <name>             e.g. plex-vaapi_alpine3.22_mesa25.1.9-r0_virgl4: current.asc
+#                                      names the previous bundle, with a new serial
+# Prints what to do on the nodes or in the Plex VM (also into the run's summary). Mesa builds aren't
+# published on their own; roll back the bundle, and fix the patch (a patch commit builds a new Mesa).
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+# shellcheck source=../lib/publish.sh
+. "$INFRA/lib/publish.sh"
+(( $# == 2 )) || die "usage: rollback qemu|virglrenderer <version> | rollback bundle <name>"
+p=$1 v=$2
+need_key
+RUN=$(date -u +%Y%m%dT%H%M%SZ)
+
+tuple_from() { # version → the input tuple in its Release, empty if it can't be read
+    release_get "$p/$1" tuple "$BASE/tuple-$1" >/dev/null 2>&1 && cat "$BASE/tuple-$1" || true
+}
+reject() {
+    local t
+    t=$(tuple_from "$v")
+    if [[ -z $t ]]; then
+        log "WARNING: no tuple in Release $p/$v; its inputs can't be marked rejected, so they may build again"
+        return 0
+    fi
+    if ! grep -qxF "$t" "$STATE/$p.rejected" 2>/dev/null; then echo "$t" >> "$STATE/$p.rejected"; fi
+    log "rejected inputs: $t"
+}
+now_published() { # version → state/<p>.published names it, or nothing
+    if [[ -n $1 ]]; then
+        kv_write "$STATE/$p.published" "tuple=$(tuple_from "$1")" "version=$1" "at=$(date +%s)" "run=$RUN" "note=after rollback of $v"
+    else
+        rm -f "$STATE/$p.published"
+    fi
+}
+
+case $p in
+qemu|virglrenderer)
+    read -r -a pkgs <<<"${PUBLISH_PKGS[$p]}"
+    window | awk -v p="${pkgs[0]}" -v v="$v" '$1 == p && $2 == v { f = 1 } END { exit !f }' ||
+        die "${pkgs[0]} $v isn't in the published apt repo"
+    aptly_init
+    fetch_window "$BASE/window" "$p" "$v"
+    shopt -s nullglob
+    snapshot_of "$BASE"/window/*.deb
+    shopt -u nullglob
+    publish_snap "$APT_PATH" "$SNAP"
+    install_dists
+    reject
+    prev=$(newest_in "$SNAP" "${pkgs[0]}")
+    now_published "$prev"
+    release_title "$p/$v" "$p $v (rolled back)"
+    log "published: $SNAP, without ${pkgs[*]} $v"
+    if [[ -n $prev ]]; then
+        msg="On each opted-in node that has $v installed:
+  apt update
+  apt install --allow-downgrades $(for pkg in "${pkgs[@]}"; do printf '%s=%s ' "$pkg" "$prev"; done)
+then reboot the node, or restart its virtio-gl VMs ($( [[ $p == qemu ]] && echo "they keep the old QEMU until then" || echo "QEMU loads the library at VM start"))."
+    else
+        msg="No other version of ${pkgs[0]} is left in the repo; the nodes keep what they have installed."
+    fi
+    ;;
+bundle)
+    bundle_list | awk -v n="$v" '$1 == n { f = 1 } END { exit !f }' || die "$v isn't a published bundle (see $STATE/bundles)"
+    prev=$(bundle_list | awk -v n="$v" '$1 != n { last = $1 } END { print last }')
+    [[ -n $prev ]] || die "$v is the only bundle; there's nothing to go back to"
+    bundle_list | awk -v n="$v" '$1 != n' | bundle_list_set
+    bundle_index "$prev"
+    release_get "bundle/$prev" MANIFEST "$STATE/bundle.MANIFEST" || die "can't download $prev's MANIFEST"
+    reject
+    now_published "$prev"
+    release_title "bundle/$v" "bundle $v (rolled back)"
+    msg="current.asc now names $prev.
+
+In the Plex VM, either restart the container (docker restart plex), and the init script switches
+to $prev, or hold it there whatever is published later: PLEX_VAAPI_BUNDLE=$prev in the compose file."
+    ;;
+*) die "rollback: qemu, virglrenderer or bundle" ;;
+esac
+printf '%s\n' "$msg"
+# shellcheck disable=SC2016  # the backticks are Markdown
+printf '### virgl builds: rollback of %s %s\n\n```\n%s\n```\n' "$p" "$v" "$msg" | gh_summary

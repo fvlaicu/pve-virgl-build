@@ -1,0 +1,9 @@
+origin=xz
+aports=main/xz at 2715415e33c4d23ee945e9f0f5d8d93b36b0fe01 (3.22-stable)
+version=5.8.4-r0
+collected=2026-10-27 by bin/collect-licenses
+file=COPYING from xz-5.8.4.tar.gz:xz-5.8.4/COPYING sha512=6a0e9c3b05f9c20255c5e35c06fdcd44b9e201f4ed566d1dec052b6cfda6cdfb42f73ffd258eaad2d8b7737c66b78ae353aebd44502e24a3d89d8765d698dcae
+file=COPYING.0BSD from xz-5.8.4.tar.gz:xz-5.8.4/COPYING.0BSD sha512=6a0e9c3b05f9c20255c5e35c06fdcd44b9e201f4ed566d1dec052b6cfda6cdfb42f73ffd258eaad2d8b7737c66b78ae353aebd44502e24a3d89d8765d698dcae
+file=COPYING.GPLv2 from xz-5.8.4.tar.gz:xz-5.8.4/COPYING.GPLv2 sha512=6a0e9c3b05f9c20255c5e35c06fdcd44b9e201f4ed566d1dec052b6cfda6cdfb42f73ffd258eaad2d8b7737c66b78ae353aebd44502e24a3d89d8765d698dcae
+file=COPYING.GPLv3 from xz-5.8.4.tar.gz:xz-5.8.4/COPYING.GPLv3 sha512=6a0e9c3b05f9c20255c5e35c06fdcd44b9e201f4ed566d1dec052b6cfda6cdfb42f73ffd258eaad2d8b7737c66b78ae353aebd44502e24a3d89d8765d698dcae
+file=COPYING.LGPLv2.1 from xz-5.8.4.tar.gz:xz-5.8.4/COPYING.LGPLv2.1 sha512=6a0e9c3b05f9c20255c5e35c06fdcd44b9e201f4ed566d1dec052b6cfda6cdfb42f73ffd258eaad2d8b7737c66b78ae353aebd44502e24a3d89d8765d698dcae

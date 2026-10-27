@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Generates the repo's signing key, once (docs/DESIGN.md, "Signing key"): ed25519, no expiry, no
+# passphrase (signing is unattended). Run it in your own terminal, not through an assistant: the
+# secret key is written to <dir>, which must not exist yet. It never touches your own keyring.
+#   bin/make-key <dir>
+# Writes into <dir> (0700):
+#   pve-virgl.asc     public, armored: commit as node/pve-virgl.asc
+#   pve-virgl.gpg     public, binary: commit as guest/pve-virgl.gpg (the Plex VM's gpgv)
+#   secret.asc            the secret key: to the password manager, and to the Actions secret
+#   revocation.asc        gpg's revocation certificate: to the password manager
+#   gnupg/                the throwaway GNUPGHOME; delete <dir> when the two copies exist
+# and prints the fingerprint for build.conf's GPG_FPR.
+set -euo pipefail
+export LC_ALL=C
+infra=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+# shellcheck source=../build.conf
+. "$infra/build.conf"
+(( $# == 1 )) || { echo "usage: make-key <new directory>"; exit 1; }
+dir=$1
+[[ ! -e $dir ]] || { echo "$dir exists; give a new directory"; exit 1; }
+install -d -m 0700 "$dir" "$dir/gnupg"
+export GNUPGHOME=$dir/gnupg
+uid="pve-virgl signing key <$DEBEMAIL>"
+gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key "$uid" ed25519 sign never 2>/dev/null
+fpr=$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^fpr:/ { print $10; exit }')
+gpg --batch --export-options export-minimal --armor --export "$fpr" > "$dir/pve-virgl.asc"
+gpg --batch --export-options export-minimal --export "$fpr" > "$dir/pve-virgl.gpg"
+(umask 077; gpg --batch --pinentry-mode loopback --passphrase '' --armor --export-secret-keys "$fpr" > "$dir/secret.asc")
+cp "$GNUPGHOME/openpgp-revocs.d/$fpr.rev" "$dir/revocation.asc"
+chmod 0600 "$dir/revocation.asc"
+gpgconf --kill gpg-agent 2>/dev/null || true
+cat <<EOF
+
+fingerprint: $fpr
+  1. build.conf: GPG_FPR=$fpr
+  2. cp $dir/pve-virgl.asc node/ && cp $dir/pve-virgl.gpg guest/   (commit both with step 1)
+  3. after bin/setup-github: gh secret set VIRGL_SIGNING_KEY --env publish --repo $REPO < $dir/secret.asc
+  4. secret.asc and revocation.asc into the password manager (not for a test key)
+  5. rm -rf $dir
+EOF
