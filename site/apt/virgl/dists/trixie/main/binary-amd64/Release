@@ -1,0 +1,7 @@
+Origin: pve-virgl
+Label: pve-virgl
+Archive: trixie
+Suite: trixie
+Architecture: amd64
+Component: main
+Acquire-By-Hash: yes
