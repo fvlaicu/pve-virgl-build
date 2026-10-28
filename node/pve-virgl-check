@@ -8,7 +8,9 @@
 set -u
 export LC_ALL=C
 STALE_DAYS=3   # build.conf's STALE_DAYS (make lint checks that they agree)
-# Our repo is whatever the installed .sources names; every other source counts as stock.
+DIST=trixie   # build.conf's DIST (make lint checks that they agree)
+TRACK_SUITE=pve-no-subscription   # build.conf's TRACK_SUITE (make lint checks that they agree)
+# Our repo is whatever the installed .sources names; stock is what tracked_versions finds.
 ours=$(sed -n 's/^URIs: *//p' /etc/apt/sources.list.d/pve-virgl.sources 2>/dev/null | head -n 1)
 [[ -n $ours ]] || exit 0
 status=${ours%/apt/*}/files/status/
@@ -22,19 +24,54 @@ newest() { # stdin: versions → the highest by dpkg's rules
     echo "$best"
 }
 
+# The versions of $1 in the suites the builds follow (bin/check-upstream): Proxmox's $DIST
+# $TRACK_SUITE, and Debian's $DIST, $DIST-updates and $DIST-security (main). Matched by the Release
+# fields apt-cache policy shows (origin, codename, component), not by the sources' suite names, so a
+# mirror or "stable" in a sources file is still the same suite, and forky, sid or backports never
+# counts as stock.
+tracked_versions() {
+    awk -v dist="$DIST" -v track="$TRACK_SUITE" '
+        FILENAME == ARGV[1] {   # apt-cache policy: each index, then the Release fields it came from
+            if ($0 == "Package files:") { files = 1; next }
+            if (!files || $0 !~ /^ /) { files = 0; next }
+            if ($1 == "release") rel[key] = substr($0, index($0, "release ") + 8)
+            else if ($1 ~ /^-?[0-9]+$/) { key = $0; sub(/^ *-?[0-9]+ /, "", key) }
+            next
+        }
+        # apt-cache policy <pkg>: "     <version> <prio>" (" *** " when installed), then its indexes
+        /^ \*\*\* / { ver = $2; next }
+        /^     [^ ]/ { ver = $1; next }
+        /^      / {
+            key = $0; sub(/^ *-?[0-9]+ /, "", key)
+            o = ""; cn = ""; c = ""
+            n = split(rel[key], f, ",")
+            for (i = 1; i <= n; i++) {
+                if (f[i] ~ /^o=/) o = substr(f[i], 3)
+                else if (f[i] ~ /^n=/) cn = substr(f[i], 3)
+                else if (f[i] ~ /^c=/) c = substr(f[i], 3)
+            }
+            if ((o == "Proxmox" && cn == dist && c == track) ||
+                (o == "Debian" && c == "main" && (cn == dist || cn == dist "-updates" || cn == dist "-security"))) print ver
+        }
+    ' <(apt-cache policy 2>/dev/null) <(apt-cache policy "$1" 2>/dev/null)
+}
+
 for pkg in pve-qemu-kvm libvirglrenderer1 virgl-server; do
     st=$(dpkg-query -W -f='${db:Status-Status} ${Version}' "$pkg" 2>/dev/null) || continue
     [[ $st == "installed "* ]] || continue
     inst=${st#installed }
-    # "pve-qemu-kvm | 11.0.3-4 | http://download.proxmox.com/debian/pve trixie/... Packages"
-    stock=$(apt-cache madison "$pkg" 2>/dev/null | awk -F' *[|] *' -v o="$ours " 'index($3, o) != 1 { print $2 }' | newest)
     if [[ ! $inst =~ virgl[0-9]+$ ]]; then
         echo "pve-virgl: $pkg $inst is not a virgl build, so no hardware video. node/opt-in.sh installs ours."
         continue
     fi
+    stock=$(tracked_versions "$pkg" | newest)
+    if [[ -z $stock ]]; then
+        echo "pve-virgl: no $pkg in the suites the builds follow (Proxmox $DIST $TRACK_SUITE; Debian $DIST, $DIST-updates, $DIST-security) among this node's sources, so nothing to compare $inst with."
+        continue
+    fi
     # base of "11.0.3-4virgl2", and of the hand builds' "1.1.0-2+virgl5"
     base=$(sed -E 's/\+?virgl[0-9]+$//' <<<"$inst")
-    if [[ -n $stock ]] && dpkg --compare-versions "$stock" gt "$base"; then
+    if dpkg --compare-versions "$stock" gt "$base"; then
         echo "pve-virgl: $pkg $stock is out, but this node keeps $inst (built on $base) until our rebuild is published. Status: $status"
     fi
 done

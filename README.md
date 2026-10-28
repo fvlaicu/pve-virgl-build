@@ -67,7 +67,7 @@ bash node/opt-out.sh --yes    # removes the repo files, installs stock
 
 - **Opt-in installs:** `/etc/apt/keyrings/pve-virgl.asc`, `/etc/apt/sources.list.d/pve-virgl.sources` (from `build.conf`'s `PAGES_URL`), `/etc/apt/preferences.d/pve-virgl.pref` (ours at 990, stock at 50), and the apt check (`/etc/apt/apt.conf.d/99pve-virgl-check`, `/usr/local/sbin/pve-virgl-check`).
 - **Updates:** `apt update && apt full-upgrade`, then reboot the node (or restart the virtio-gl VMs).
-- **The apt check:** after each `apt update`, it prints a line when Proxmox or Debian has a newer base than the virgl build the pin keeps (our rebuild isn't out yet), and when the builds haven't run for `STALE_DAYS`.
+- **The apt check:** after each `apt update`, it prints a line when Proxmox or Debian has a newer base than the virgl build the pin keeps (our rebuild isn't out yet), and when the builds haven't run for `STALE_DAYS`. It compares only with the suites the builds follow (Proxmox's `pve-no-subscription`, Debian's trixie, -updates and -security, told apart by their Release fields), and `opt-out.sh` goes back to the newest version in those suites: forky, sid or backports in a node's sources never count.
 
 ## Plex VM
 
