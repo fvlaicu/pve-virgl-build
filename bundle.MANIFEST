@@ -1,5 +1,5 @@
-bundle=plex-vaapi_alpine3.22_mesa25.1.9-r0_virgl10
-built=2026-10-27T21:40:53Z
+bundle=plex-vaapi_alpine3.22_mesa25.1.9-r0_virgl11
+built=2026-11-02T20:48:34Z
 alpine_release=3.22.7
 mesa=25.1.9-r105
 alpine_mesa=25.1.9-r0
@@ -13,7 +13,7 @@ runpath=/vaapi/lib:$ORIGIN/..
 owner libbsd 0.12.2-r0 index
 owner libdrm 2.4.124-r0 index
 owner libelf 0.193-r0 index
-owner libexpat 2.9.0-r0 index
+owner libexpat 2.10.0-r0 index
 owner libffi 3.4.8-r0 index
 owner libgcc 14.2.0-r6 index
 owner libmd 1.1.0-r0 index
@@ -47,7 +47,7 @@ file 87744 vaapi/lib/libdrm.so.2 libdrm-2.4.124-r0
 file 42608 vaapi/lib/libdrm_amdgpu.so.1 libdrm-2.4.124-r0
 file 146520 vaapi/lib/libdrm_intel.so.1 libdrm-2.4.124-r0
 file 87968 vaapi/lib/libelf.so.1 libelf-0.193-r0
-file 140992 vaapi/lib/libexpat.so.1 libexpat-2.9.0-r0
+file 145088 vaapi/lib/libexpat.so.1 libexpat-2.10.0-r0
 file 38960 vaapi/lib/libffi.so.8 libffi-3.4.8-r0
 file 173920 vaapi/lib/libgcc_s.so.1 libgcc-14.2.0-r6
 file 231288 vaapi/lib/liblzma.so.5 xz-libs-5.8.4-r0
