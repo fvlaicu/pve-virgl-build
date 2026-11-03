@@ -10,7 +10,9 @@
 #   byhash                     apt update against /t/live with the previous deploy's InRelease
 #   plex                       the Plex init script against /t/live: fetch, restart, tampered index,
 #                              replayed older index, corrupt tarball, unreachable, hold
-#   node                       the nodes' apt check: stale and fresh status.json
+#   node                       the nodes' apt check: stale and fresh status.json; a newer Proxmox
+#                              base warns while our repo has only builds on the old one, and is
+#                              silent once our rebuild is published (not installed) and installed
 #   sources                    the published bundle's Release has its copyleft sources and the bundle
 #                              its license texts; verify fails on a changed file, a missing tar, an
 #                              unreviewed license, a symlink, a library without license texts
@@ -187,6 +189,49 @@ node)
         else echo "$o" | grep -q "haven't run since" && pass "node check: 5-day-old status.json warns" || { echo "$o"; fail "node check: stale"; }
         fi
     done
+    # The rebuild line, with dummy pve-qemu-kvm debs: Proxmox has 11.1.3-1, the node 11.0.3-4virgl3.
+    # Our repo first has only builds on 11.0.3-4, then also 11.1.3-1virgl4, then the node installs it.
+    o=$(podman run --rm --security-opt label=disable -v "$R":/repo:ro docker.io/library/debian:trixie bash -euc '
+        apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq apt-utils >/dev/null 2>&1
+        rm /etc/apt/sources.list.d/debian.sources
+        mkdeb() { # <repo dir> <version>: a dummy pve-qemu-kvm in <repo dir>/pool
+            local d; d=$(mktemp -d); mkdir "$d/DEBIAN"; mkdir -p "$1/pool"
+            printf "Package: pve-qemu-kvm\nVersion: %s\nArchitecture: all\nMaintainer: test <test@example.invalid>\nDescription: test\n" "$2" > "$d/DEBIAN/control"
+            dpkg-deb -b "$d" "$1/pool/pve-qemu-kvm_$2_all.deb" >/dev/null
+        }
+        index() { # <repo dir> <origin> <component>: its trixie suite, from the debs in <repo dir>/pool
+            mkdir -p "$1/dists/trixie/$3/binary-amd64"
+            (cd "$1" && apt-ftparchive packages pool > "dists/trixie/$3/binary-amd64/Packages" &&
+                apt-ftparchive -o APT::FTPArchive::Release::Origin="$2" -o APT::FTPArchive::Release::Codename=trixie \
+                    -o APT::FTPArchive::Release::Components="$3" -o APT::FTPArchive::Release::Architectures=amd64 \
+                    release dists/trixie > /tmp/Release && mv /tmp/Release dists/trixie/Release)
+        }
+        check() { # <section>: apt update, the candidate, the apt check
+            echo "--- $1"; apt-get update -qq >/dev/null 2>&1
+            apt-cache policy pve-qemu-kvm | sed -n "s/^  Candidate: /candidate /p"
+            bash /repo/node/pve-virgl-check
+        }
+        mkdeb /srv/pve 11.0.3-4; mkdeb /srv/pve 11.1.3-1; index /srv/pve Proxmox pve-no-subscription
+        mkdeb /srv/ours/apt/virgl 11.0.3-4virgl3; mkdeb /srv/ours/apt/virgl 11.0.3-4virgl4; index /srv/ours/apt/virgl pve-virgl main
+        printf "Types: deb\nURIs: file:/srv/pve\nSuites: trixie\nComponents: pve-no-subscription\nTrusted: yes\n" > /etc/apt/sources.list.d/pve.sources
+        printf "Types: deb\nURIs: file:/srv/ours/apt/virgl\nSuites: trixie\nComponents: main\nTrusted: yes\n" > /etc/apt/sources.list.d/pve-virgl.sources
+        cp /repo/node/pve-virgl.pref /etc/apt/preferences.d/
+        dpkg -i /srv/ours/apt/virgl/pool/pve-qemu-kvm_11.0.3-4virgl3_all.deb >/dev/null
+        check old-base
+        mkdeb /srv/ours/apt/virgl 11.1.3-1virgl4; index /srv/ours/apt/virgl pve-virgl main
+        check published
+        apt-get install -y -qq pve-qemu-kvm >/dev/null 2>&1
+        check installed' 2>&1) || { echo "$o"; fail "node check: the rebuild container"; }
+    sect() { awk -v s="--- $1" '$0 == s { on = 1; next } /^--- / { on = 0 } on' <<<"$o"; }
+    s=$(sect old-base)
+    grep -qx "candidate 11.0.3-4virgl4" <<<"$s" && grep -qF "pve-qemu-kvm 11.1.3-1 is out, but this node keeps 11.0.3-4virgl3 (built on 11.0.3-4)" <<<"$s" \
+        && pass "node check: stock 11.1.3-1, our repo only on 11.0.3-4: warns" || { echo "$o"; fail "node check: old base"; }
+    s=$(sect published)
+    grep -qx "candidate 11.1.3-1virgl4" <<<"$s" && ! grep -q "^pve-virgl:" <<<"$s" \
+        && pass "node check: 11.1.3-1virgl4 published, not installed: silent" || { echo "$o"; fail "node check: published"; }
+    s=$(sect installed)
+    grep -qx "candidate 11.1.3-1virgl4" <<<"$s" && ! grep -q "^pve-virgl:" <<<"$s" \
+        && pass "node check: 11.1.3-1virgl4 installed: silent" || { echo "$o"; fail "node check: installed"; }
     ;;
 rollback)
     "$R/bin/rollback" "$@"

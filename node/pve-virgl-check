@@ -1,7 +1,9 @@
 #!/bin/bash
 # The node-side apt check (docs/DESIGN.md, "Status"), run by 99pve-virgl-check after each
 # apt update. The pin keeps our virgl build installed even when Proxmox or Debian has a newer one;
-# this says so, with both versions, until our rebuild of it is published. Silent when all is well.
+# this says so, with both versions, until our rebuild of it is published: once apt's candidate is
+# our build on that base (or a newer one), apt upgrade installs it and there is nothing to say.
+# Silent when all is well.
 # Also warns about a pinned package that isn't a virgl build at all, and when the builds have
 # stopped running (status.json older than STALE_DAYS: GitHub disables the hourly schedule of a
 # public repo after 60 days without activity). Never fails apt.
@@ -56,6 +58,30 @@ tracked_versions() {
     ' <(apt-cache policy 2>/dev/null) <(apt-cache policy "$1" 2>/dev/null)
 }
 
+# The versions of $1 in our repo: the indexes whose Release has o=pve-virgl, the origin the pin
+# (pve-virgl.pref) puts at 990. The same parsing as tracked_versions.
+our_versions() {
+    awk '
+        FILENAME == ARGV[1] {
+            if ($0 == "Package files:") { files = 1; next }
+            if (!files || $0 !~ /^ /) { files = 0; next }
+            if ($1 == "release") rel[key] = substr($0, index($0, "release ") + 8)
+            else if ($1 ~ /^-?[0-9]+$/) { key = $0; sub(/^ *-?[0-9]+ /, "", key) }
+            next
+        }
+        /^ \*\*\* / { ver = $2; next }
+        /^     [^ ]/ { ver = $1; next }
+        /^      / {
+            key = $0; sub(/^ *-?[0-9]+ /, "", key)
+            n = split(rel[key], f, ",")
+            for (i = 1; i <= n; i++) if (f[i] == "o=pve-virgl") { print ver; break }
+        }
+    ' <(apt-cache policy 2>/dev/null) <(apt-cache policy "$1" 2>/dev/null)
+}
+
+# base of "11.0.3-4virgl2", and of the hand builds' "1.1.0-2+virgl5"
+base_of() { sed -E 's/\+?virgl[0-9]+$//' <<<"$1"; }
+
 for pkg in pve-qemu-kvm libvirglrenderer1 virgl-server; do
     st=$(dpkg-query -W -f='${db:Status-Status} ${Version}' "$pkg" 2>/dev/null) || continue
     [[ $st == "installed "* ]] || continue
@@ -69,9 +95,14 @@ for pkg in pve-qemu-kvm libvirglrenderer1 virgl-server; do
         echo "pve-virgl: no $pkg in the suites the builds follow (Proxmox $DIST $TRACK_SUITE; Debian $DIST, $DIST-updates, $DIST-security) among this node's sources, so nothing to compare $inst with."
         continue
     fi
-    # base of "11.0.3-4virgl2", and of the hand builds' "1.1.0-2+virgl5"
-    base=$(sed -E 's/\+?virgl[0-9]+$//' <<<"$inst")
+    base=$(base_of "$inst")
     if dpkg --compare-versions "$stock" gt "$base"; then
+        # Published, not installed yet: apt update already lists it as upgradable.
+        cand=$(apt-cache policy "$pkg" 2>/dev/null | sed -n 's/^  Candidate: //p')
+        if [[ -n $cand ]] && our_versions "$pkg" | grep -qxF -- "$cand" &&
+            ! dpkg --compare-versions "$stock" gt "$(base_of "$cand")"; then
+            continue
+        fi
         echo "pve-virgl: $pkg $stock is out, but this node keeps $inst (built on $base) until our rebuild is published. Status: $status"
     fi
 done
