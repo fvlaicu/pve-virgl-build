@@ -1,7 +1,7 @@
-tuple=mesa=25.1.9-r105 libs=abb45aaf02c3b20c script=9dba02c8b8ba6e05 libva_minor=22 sources=gcc,elfutils,xz licenses=f90d3dbeef4721a9
-version=plex-vaapi_alpine3.22_mesa25.1.9-r0_virgl12
+tuple=mesa=25.1.9-r105 libs=dcb01ae82b592b86 script=9dba02c8b8ba6e05 libva_minor=22 sources=gcc,elfutils,xz licenses=f90d3dbeef4721a9
+version=plex-vaapi_alpine3.22_mesa25.1.9-r0_virgl13
 result=ok
 note=
-at=1794001220
+at=1795481893
 fails=0
-run=20261106T213129Z
+run=20261124T005421Z
