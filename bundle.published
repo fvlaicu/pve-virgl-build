@@ -1,4 +1,4 @@
-tuple=mesa=25.1.9-r105 libs=155fbff905235589 script=9dba02c8b8ba6e05 libva_minor=22 sources=gcc,elfutils,xz licenses=f90d3dbeef4721a9
-version=plex-vaapi_alpine3.22_mesa25.1.9-r0_virgl16
-at=1795617520
-run=20261125T143643Z
+tuple=mesa=25.1.9-r105 libs=625bb5ece5314369 script=9dba02c8b8ba6e05 libva_minor=22 sources=gcc,elfutils,xz licenses=f90d3dbeef4721a9
+version=plex-vaapi_alpine3.22_mesa25.1.9-r0_virgl17
+at=1795809654
+run=20261127T195844Z
